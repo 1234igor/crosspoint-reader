@@ -32,10 +32,22 @@ bool HalClock::getTime(uint8_t& hour, uint8_t& minute) const {
   }
   _cachedHour = dt.hour;
   _cachedMinute = dt.minute;
+  _cachedYear = dt.year;
+  _cachedMonth = dt.month;
+  _cachedDay = dt.day;
   _lastPollMs = now;
   _hasCachedTime = true;
+  _hasCachedDate = dt.year >= 2000 && dt.month >= 1 && dt.month <= 12 && dt.day >= 1 && dt.day <= 31;
   hour = _cachedHour;
   minute = _cachedMinute;
+  return true;
+}
+
+bool HalClock::getDateTime(uint16_t& year, uint8_t& month, uint8_t& day, uint8_t& hour, uint8_t& minute) const {
+  if (!getTime(hour, minute) || !_hasCachedDate) return false;
+  year = _cachedYear;
+  month = _cachedMonth;
+  day = _cachedDay;
   return true;
 }
 
@@ -97,7 +109,11 @@ bool HalClock::syncFromNTP() {
         _lastPollMs = 0;
         _cachedHour = dt.hour;
         _cachedMinute = dt.minute;
+        _cachedYear = dt.year;
+        _cachedMonth = dt.month;
+        _cachedDay = dt.day;
         _hasCachedTime = true;
+        _hasCachedDate = true;
         LOG_INF("CLK", "RTC set to %04u-%02u-%02u %02u:%02u:%02u UTC", dt.year, dt.month, dt.day, dt.hour, dt.minute,
                 dt.second);
         return true;
