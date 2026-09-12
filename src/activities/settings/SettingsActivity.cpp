@@ -80,14 +80,14 @@ void SettingsActivity::rebuildSettingsLists() {
     }
   }
 
-  if (BoardConfig::hasHomeKey()) {
-    controlsSettings.push_back(SettingInfo::Action(StrId::STR_HOME_BUTTON, SettingAction::HomeButton));
-  }
-
   // Append device-only ACTION items
   if (!BoardConfig::hasTouch()) {
     controlsSettings.insert(controlsSettings.begin(),
                             SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS, SettingAction::RemapFrontButtons));
+  }
+  if (BoardConfig::hasHomeKey()) {
+    controlsSettings.insert(controlsSettings.begin(),
+                            SettingInfo::Action(StrId::STR_HOME_BUTTON, SettingAction::HomeButton));
   }
   systemSettings.push_back(SettingInfo::Action(StrId::STR_WIFI_NETWORKS, SettingAction::Network));
   systemSettings.push_back(SettingInfo::Action(StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync));
