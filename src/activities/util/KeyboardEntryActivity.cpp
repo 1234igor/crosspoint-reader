@@ -513,10 +513,14 @@ fui::Rect KeyboardEntryActivity::keyboardRect() const {
   const int rows = currentLayout().rowCount;
   const int safeWidth = pageWidth - left - right;
   const int width = safeWidth * metrics.keyboardWidthPercent / 100;
-  const fui::Insets padding{5, 2, 5, 2};
+  const bool touch = gpio.hasTouch();
+  const fui::Insets padding = touch ? fui::Insets{5, 2, 5, 2} : fui::Insets{};
+  // Only touch keyboards grow with screen width. Button navigation keeps the
+  // theme's compact, fixed row height across every keyboard layer.
   const int preferred =
-      fui::keyboardPreferredHeight(width, rows, padding, metrics.keyboardRowSpacing, metrics.keyboardKeyHeight);
-  const int extraGap = std::max(0, metrics.keyboardRowSpacing - 2);
+      touch ? fui::keyboardPreferredHeight(width, rows, padding, metrics.keyboardRowSpacing, metrics.keyboardKeyHeight)
+            : rows * metrics.keyboardKeyHeight + metrics.keyboardRowSpacing * std::max(0, rows - 1);
+  const int extraGap = touch ? std::max(0, metrics.keyboardRowSpacing - 2) : 0;
   const int maxHeight = (pageHeight - top - bottom) / 2 + extraGap * std::max(0, rows - 1);
   const int keyboardBottom = pageHeight - std::max(bottom, metrics.buttonHintsHeight) - metrics.verticalSpacing;
   const int fieldBottom = std::max(top, metrics.topPadding) + metrics.headerHeight + metrics.verticalSpacing * 5 +
@@ -985,7 +989,7 @@ void KeyboardEntryActivity::render(RenderLock&&) {
   props.altText.font = fui::GfxRendererTarget::FONT_SMALL;
   props.gap = static_cast<int16_t>(metrics.keyboardKeySpacing);
   props.rowGap = static_cast<int16_t>(metrics.keyboardRowSpacing);
-  props.padding = fui::Insets{5, 2, 5, 2};
+  props.padding = gpio.hasTouch() ? fui::Insets{5, 2, 5, 2} : fui::Insets{};
   // Fingers land low on the bottom row (occlusion) and there is no key below
   // to catch the miss — extend its hit band down to the button hints bar.
   const int hintsTop = renderer.getScreenHeight() - metrics.buttonHintsHeight;
