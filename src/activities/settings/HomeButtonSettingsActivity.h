@@ -2,6 +2,7 @@
 
 #include "HomeButtonSettings.h"
 #include "activities/UiListActivity.h"
+#include "components/OptionPopup.h"
 
 class HomeButtonSettingsActivity final : public UiListActivity {
  public:
@@ -9,11 +10,15 @@ class HomeButtonSettingsActivity final : public UiListActivity {
       : UiListActivity("HomeButtonSettings", renderer, input) {}
 
  private:
-  int gesture = -1;
-  freeink::ui::ListItem rows[static_cast<unsigned>(HomeButtonAction::Count)]{};
-  int listCount() const override { return gesture < 0 ? 3 : static_cast<int>(HomeButtonAction::Count); }
-  const char* headerTitle() const override;
+  static constexpr int GESTURE_COUNT = 3;
+
+  freeink::ui::ListItem rows[GESTURE_COUNT]{};
+  OptionPopup optionPopup;
+
+  int listCount() const override { return GESTURE_COUNT; }
+  const char* headerTitle() const override { return tr(STR_HOME_BUTTON); }
   void buildScreen(UiScreen& screen) override;
   void activateIndex(int index) override;
-  void onBackButton() override;
+  bool handleCustomInput() override;
+  void render(RenderLock&&) override;
 };
