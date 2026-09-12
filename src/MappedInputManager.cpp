@@ -13,7 +13,7 @@
 
 namespace fui = freeink::ui;
 
-void MappedInputManager::update() const {
+void MappedInputManager::update(const bool deferHomeButtonAction) const {
   gpio.update();
   homeAction = HomeButtonAction::Ignore;
   if (gpio.hasHomeKey()) {
@@ -22,6 +22,16 @@ void MappedInputManager::update() const {
                                         static_cast<HomeButtonAction>(SETTINGS.homeButtonTapAction),
                                         static_cast<HomeButtonAction>(SETTINGS.homeButtonDoubleTapAction),
                                         static_cast<HomeButtonAction>(SETTINGS.homeButtonLongPressAction));
+  }
+  if (deferHomeButtonAction) {
+    // Keep the first action observed during a synchronous transfer. Home must
+    // still be visible now so the transfer can cancel and unwind promptly.
+    if (homeAction != HomeButtonAction::Ignore && deferredHomeAction == HomeButtonAction::Ignore) {
+      deferredHomeAction = homeAction;
+    }
+  } else if (deferredHomeAction != HomeButtonAction::Ignore) {
+    homeAction = deferredHomeAction;
+    deferredHomeAction = HomeButtonAction::Ignore;
   }
   for (uint8_t value = 0; value <= static_cast<uint8_t>(Button::ScreenDown); ++value) {
     if (!isPressed(static_cast<Button>(value))) longPressFiredButtons &= ~(1u << value);

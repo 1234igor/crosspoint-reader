@@ -1,7 +1,10 @@
-cmake_minimum_required(VERSION 3.16)
-project(home_button_test LANGUAGES CXX)
-set(CMAKE_CXX_STANDARD 17)
-add_executable(home_button_test HomeButtonInputTest.cpp)
-target_include_directories(home_button_test PRIVATE ../../src)
-enable_testing()
-add_test(NAME home_button COMMAND home_button_test)
+add_executable(HomeButtonInputTest HomeButtonInputTest.cpp)
+
+target_include_directories(HomeButtonInputTest PRIVATE ../../src)
+
+target_link_libraries(HomeButtonInputTest PRIVATE
+  crosspoint_test_common
+  GTest::gtest_main
+)
+
+gtest_discover_tests(HomeButtonInputTest)

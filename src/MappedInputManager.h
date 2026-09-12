@@ -41,7 +41,10 @@ class MappedInputManager {
 
   MappedInputManager(HalGPIO& gpio, const GfxRenderer& renderer) : gpio(gpio), renderer(renderer) {}
 
-  void update() const;
+  // Blocking transfer loops pump physical input themselves. Defer configured
+  // Home-key actions so the next main-loop pass can dispatch them, while the
+  // current action remains available for immediate Home cancellation.
+  void update(bool deferHomeButtonAction = false) const;
 #if FREEINK_CAP_TOUCH
   // X4 Pro delays a single power click until its frontlight double-click window
   // expires. The main loop supplies that one-frame event here.
@@ -92,7 +95,10 @@ class MappedInputManager {
   bool wasHomeGesture() const;
   // Configured one-frame action, independent of the gesture that triggered it.
   HomeButtonAction homeButtonAction() const { return homeAction; }
-  void resetHomeButtonInput() const { homeButtonInput.reset(); }
+  void resetHomeButtonInput() const {
+    homeButtonInput.reset();
+    deferredHomeAction = HomeButtonAction::Ignore;
+  }
   bool wasMenuGesture() const;
   // Bottom-edge up-swipe as the reader-menu gesture (SHOW_READER_MENU's Swipe
   // Up option). Only meaningful on home-key boards, where Home lives on the
@@ -145,6 +151,7 @@ class MappedInputManager {
 
   mutable HomeButtonInput homeButtonInput;
   mutable HomeButtonAction homeAction = HomeButtonAction::Ignore;
+  mutable HomeButtonAction deferredHomeAction = HomeButtonAction::Ignore;
   mutable bool touchHeldOverrideValid = false;
   mutable unsigned long touchHeldOverrideMs = 0;
   mutable unsigned long touchHeldOverrideAt = 0;
