@@ -82,6 +82,7 @@ class GfxRenderer {
   mutable int _stripY0 = 0;
   mutable int _stripRows = 0;
   mutable bool _stripActive = false;
+  void (*preDisplayHook)() = nullptr;
 
   // CJK UI font fallback map: primary (built-in, Latin-only) UI font id -> a
   // size-matched SD-card font id that carries CJK glyphs. When a string drawn
@@ -194,6 +195,10 @@ class GfxRenderer {
   int getScreenHeight() const;
   void tapToLogical(float nx, float ny, int& outX, int& outY) const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
+  // Called right before every framebuffer send (displayBuffer, displayBufferAsync,
+  // displayGrayscaleBase). Lets an overlay owner (the input-lock badge in
+  // main.cpp) re-stamp itself after an activity repaints the buffer.
+  void setPreDisplayHook(void (*hook)()) { preDisplayHook = hook; }
   // One-shot: the next displayBuffer()/displayBufferAsync() call uses `mode`
   // instead of what its caller asked for, then the override clears itself.
   // Lets a closing overlay (the control center's refresh tile) hand a

@@ -49,10 +49,16 @@ SdCardFontSystem sdFontSystem;
 FontCacheManager fontCacheManager(renderer.getFontMap(), renderer.getSdCardFonts());
 static unsigned long allowSleepAt = 0;
 static unsigned long lastX4ProPowerClickAt = 0;
+static unsigned long lastLockPowerClickAt = 0;
 
 namespace {
 constexpr unsigned long X4PRO_POWER_DOUBLE_CLICK_MS = 500;
 constexpr unsigned long X4PRO_POWER_CLICK_MAX_HOLD_MS = 300;
+// Input lock double-tap: two power releases within this window, each held at
+// most this long. Both are under the 400 ms long-press sleep threshold, so a
+// tap never sleeps the device and a hold never counts as a tap.
+constexpr unsigned long INPUT_LOCK_DOUBLE_CLICK_MS = 500;
+constexpr unsigned long INPUT_LOCK_CLICK_MAX_HOLD_MS = 300;
 }  // namespace
 
 // A wake hold must never become an in-app power-button action.  Boot may continue
@@ -203,6 +209,114 @@ void restartToHomeAfterStorageHandoff() {
   delay(50);
   handoffUsbOtgToSerialJtag();
   ESP.restart();
+}
+
+// Input-lock badge: a padlock in the top-right corner, drawn straight into the
+// framebuffer over whatever is on screen and pushed with one FAST differential
+// refresh (the dictionary highlight uses the same snapshot/restore trick). The
+// pixels under it are saved so unlock restores them with a second FAST refresh;
+// no activity repaint, so lock and unlock each cost ~one fast refresh.
+//
+// The rect is 8-px aligned in both axes (32x32 at a multiple-of-8 offset from
+// a multiple-of-8 screen edge), so readFramebufferRegion returns exactly the
+// badge bytes and a byte compare tells whether the badge is currently in the
+// buffer. That makes the pre-display hook safe: it re-stamps only when an
+// activity has repainted over the badge, and erase only restores when the
+// badge is really there (never over fresh content).
+namespace {
+constexpr int LOCK_BADGE_SIZE = 32;
+constexpr int LOCK_BADGE_INSET = 8;
+constexpr size_t LOCK_BADGE_BYTES = LOCK_BADGE_SIZE * LOCK_BADGE_SIZE / 8;
+uint8_t lockBadgeUnder[LOCK_BADGE_BYTES];  // pixels the badge covers
+uint8_t lockBadgeStamp[LOCK_BADGE_BYTES];  // the badge as it reads back
+uint8_t lockBadgeProbe[LOCK_BADGE_BYTES];
+bool lockBadgeValid = false;
+
+void lockBadgeOrigin(int& x, int& y) {
+  x = renderer.getScreenWidth() - LOCK_BADGE_INSET - LOCK_BADGE_SIZE;
+  y = LOCK_BADGE_INSET;
+}
+
+bool lockBadgeOnBuffer() {
+  int x, y;
+  lockBadgeOrigin(x, y);
+  return lockBadgeValid &&
+         renderer.readFramebufferRegion(x, y, LOCK_BADGE_SIZE, LOCK_BADGE_SIZE, lockBadgeProbe, LOCK_BADGE_BYTES) ==
+             LOCK_BADGE_BYTES &&
+         memcmp(lockBadgeProbe, lockBadgeStamp, LOCK_BADGE_BYTES) == 0;
+}
+
+void drawLockBadge() {
+  if (lockBadgeOnBuffer()) return;
+  int x, y;
+  lockBadgeOrigin(x, y);
+  if (renderer.readFramebufferRegion(x, y, LOCK_BADGE_SIZE, LOCK_BADGE_SIZE, lockBadgeUnder, LOCK_BADGE_BYTES) !=
+      LOCK_BADGE_BYTES) {
+    return;
+  }
+  // White tile with a 2 px frame, padlock inside: shackle ring on top, solid
+  // body below, one white keyhole slot.
+  renderer.fillRect(x, y, LOCK_BADGE_SIZE, LOCK_BADGE_SIZE, false);
+  renderer.drawRect(x, y, LOCK_BADGE_SIZE, LOCK_BADGE_SIZE, 2, true);
+  renderer.drawRect(x + 10, y + 5, 12, 12, 2, true);
+  renderer.fillRect(x + 7, y + 14, 18, 12, true);
+  renderer.fillRect(x + 15, y + 17, 2, 5, false);
+  lockBadgeValid = renderer.readFramebufferRegion(x, y, LOCK_BADGE_SIZE, LOCK_BADGE_SIZE, lockBadgeStamp,
+                                                  LOCK_BADGE_BYTES) == LOCK_BADGE_BYTES;
+}
+
+void eraseLockBadge() {
+  if (!lockBadgeOnBuffer()) {
+    lockBadgeValid = false;
+    return;
+  }
+  int x, y;
+  lockBadgeOrigin(x, y);
+  renderer.writeFramebufferRegion(x, y, LOCK_BADGE_SIZE, LOCK_BADGE_SIZE, lockBadgeUnder);
+  lockBadgeValid = false;
+}
+
+// Runs inside every framebuffer send: keep the badge on top of whatever an
+// activity painted while the lock is on.
+void lockBadgePreDisplay() {
+  if (mappedInputManager.isInputLocked()) drawLockBadge();
+}
+}  // namespace
+
+// Double-tap the power button to toggle the input lock. The X4 Pro keeps its
+// frontlight double-click instead. A short-power setting of Sleep drops the
+// hold threshold to 10 ms, so every tap sleeps before a second one can
+// arrive; the lock is unreachable there.
+bool handleInputLockDoubleClick() {
+  if (BoardConfig::isX4Pro() || !gpio.wasReleased(HalGPIO::BTN_POWER)) {
+    return false;
+  }
+
+  const unsigned long now = millis();
+  if (gpio.getPowerButtonHeldTime() > INPUT_LOCK_CLICK_MAX_HOLD_MS) {
+    lastLockPowerClickAt = 0;
+    return false;
+  }
+
+  if (lastLockPowerClickAt == 0 || now - lastLockPowerClickAt > INPUT_LOCK_DOUBLE_CLICK_MS) {
+    lastLockPowerClickAt = now;
+    return false;
+  }
+
+  lastLockPowerClickAt = 0;
+  const bool locked = !mappedInputManager.isInputLocked();
+  mappedInputManager.setInputLocked(locked);
+  {
+    RenderLock lock;
+    if (locked) {
+      drawLockBadge();
+    } else {
+      eraseLockBadge();
+    }
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  }
+  LOG_INF("LOCK", "Input %s by power-button double-tap", locked ? "locked" : "unlocked");
+  return true;
 }
 
 bool handleX4ProFrontlightDoubleClick() {
@@ -573,6 +687,7 @@ void setup() {
     gpio.update();
   }
 
+  renderer.setPreDisplayHook(&lockBadgePreDisplay);
   allowSleepAt = millis() + 2000;
 }
 
@@ -670,6 +785,12 @@ void loop() {
   // Consume the second X4 Pro power-button release so it does not also run a
   // configured short-power action after toggling the frontlight.
   if (handleX4ProFrontlightDoubleClick()) {
+    return;
+  }
+
+  // Consume the second release of an input-lock double-tap so it does not also
+  // run a configured short-power action.
+  if (handleInputLockDoubleClick()) {
     return;
   }
 

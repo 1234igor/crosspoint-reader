@@ -45,6 +45,13 @@ class MappedInputManager {
   // expires. The main loop supplies that one-frame event here.
   void setPowerConfirmClickFrame(const bool clicked) { powerConfirmClickFrame = clicked; }
 #endif
+  // Input lock (toggled by a power-button double-tap in main.cpp). While locked
+  // every button, touch and gesture query reports nothing, so activities see a
+  // device with no input. main.cpp reads the raw power button through HalGPIO,
+  // so the unlock double-tap and long-press sleep keep working. Deep sleep is a
+  // chip reset, so the lock clears on wake.
+  void setInputLocked(const bool locked) { inputLocked = locked; }
+  bool isInputLocked() const { return inputLocked; }
   bool wasPressed(Button button) const;
   bool wasReleased(Button button) const;
   // One-shot threshold event while the button is down; consumes its release.
@@ -145,6 +152,7 @@ class MappedInputManager {
   mutable unsigned long touchHeldOverrideAt = 0;
   mutable uint16_t longPressFiredButtons = 0;
   mutable uint16_t suppressedReleaseButtons = 0;
+  bool inputLocked = false;
 #if FREEINK_CAP_TOUCH
   bool powerConfirmClickFrame = false;
 #endif
