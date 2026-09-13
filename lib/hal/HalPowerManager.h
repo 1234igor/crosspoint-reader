@@ -42,6 +42,15 @@ class HalPowerManager {
   // Should be called inside main loop() to handle the currentLockMode
   void startDeepSleep(HalGPIO& gpio) const;
 
+  // Light-sleep the chip for up to `sliceMs` (timer wake), waking early the
+  // moment the power button reaches its pressed level (GPIO level wake). RAM,
+  // peripherals, the SD mount and the panel image are all retained; the caller
+  // resumes exactly where it was. Returns false WITHOUT sleeping when unsafe:
+  // a performance Lock is held (a render is in flight), WiFi is up, or USB is
+  // connected (light sleep kills the CDC link). Ported from upstream #2525,
+  // which measured idle at 2.8 mA vs 9.7 mA on an X3. Used by the input lock.
+  bool lightSleep(const HalGPIO& gpio, unsigned long sliceMs) const;
+
   // Get battery percentage (range 0-100)
   uint16_t getBatteryPercentage() const;
 

@@ -59,6 +59,10 @@ constexpr unsigned long X4PRO_POWER_CLICK_MAX_HOLD_MS = 300;
 // tap never sleeps the device and a hold never counts as a tap.
 constexpr unsigned long INPUT_LOCK_DOUBLE_CLICK_MS = 500;
 constexpr unsigned long INPUT_LOCK_CLICK_MAX_HOLD_MS = 300;
+// While locked: light-sleep between power-button polls after this much quiet
+// (covers the double-tap window and the badge refresh), in slices this long.
+constexpr unsigned long LOCK_LIGHT_SLEEP_AFTER_MS = 1000;
+constexpr unsigned long LOCK_LIGHT_SLEEP_SLICE_MS = 1000;
 }  // namespace
 
 // A wake hold must never become an in-app power-button action.  Boot may continue
@@ -806,7 +810,7 @@ void loop() {
 #endif
 
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
-  if (sleepTimeoutMs > 0 && millis() - lastActivityTime >= sleepTimeoutMs) {
+  if (sleepTimeoutMs > 0 && !mappedInputManager.isInputLocked() && millis() - lastActivityTime >= sleepTimeoutMs) {
     LOG_DBG("SLP", "Auto-sleep triggered after %lu ms of inactivity", sleepTimeoutMs);
     enterDeepSleep(true);
     // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
@@ -881,6 +885,20 @@ void loop() {
   if (activityManager.skipLoopDelay()) {
     powerManager.setPowerSaving(false);  // Make sure we're at full performance when skipLoopDelay is requested
     yield();                             // Give FreeRTOS a chance to run tasks, but return immediately
+  } else if (mappedInputManager.isInputLocked() && millis() - lastActivityTime >= LOCK_LIGHT_SLEEP_AFTER_MS) {
+    // Input lock: the page stays on the panel (e-ink holds it unpowered) and
+    // only the power button matters, so instead of polling at 10 MHz halt the
+    // chip and let the power button's GPIO level wake it. The timer wake is
+    // just housekeeping (USB detection) once a second. Awake windows run at
+    // full clock: the per-millisecond floor is paid regardless of CPU speed,
+    // so finishing the wake work fast and sleeping again costs less charge.
+    // A raw contact mid-debounce polls at 100 Hz instead so a tap is never
+    // lost, and the double-tap window after any press stays fully awake
+    // (lastActivityTime resets on every press/release).
+    powerManager.setPowerSaving(false);
+    if (gpio.rawInputActive() || !powerManager.lightSleep(gpio, LOCK_LIGHT_SLEEP_SLICE_MS)) {
+      delay(10);
+    }
   } else {
     if (millis() - lastActivityTime >= HalPowerManager::IDLE_POWER_SAVING_MS) {
       // If we've been inactive for a while, increase the delay to save power

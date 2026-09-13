@@ -44,6 +44,8 @@ class HalGPIO {
 #endif
 
   bool lastUsbConnected = false;
+
+  unsigned long usbLastPollMs = 0;
   bool usbStateChanged = false;
 
  public:
@@ -116,6 +118,9 @@ class HalGPIO {
 
   // Check if USB is connected
   bool isUsbConnected() const;
+  // Last sampled USB verdict (update() polls it once per USB_POLL_MS).
+  bool isUsbConnectedCached() const { return lastUsbConnected; }
+  static constexpr unsigned long USB_POLL_MS = 1000;
 
   // Whether a cold boot with no USB detected can be trusted to mean a held
   // power button (Xteink-style button-energized rail with reliable USB

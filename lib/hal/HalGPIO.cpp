@@ -141,9 +141,17 @@ void HalGPIO::begin() {
 
 void HalGPIO::update() {
   inputMgr.update();
-  const bool connected = isUsbConnected();
-  usbStateChanged = (connected != lastUsbConnected);
-  lastUsbConnected = connected;
+  // On the X3 isUsbConnected() is an I2C read of the fuel gauge (with a 2 ms
+  // retry delay); it used to run on every loop iteration, i.e. up to 100x/s.
+  // A USB plug/unplug is a human-speed event: sample it once a second.
+  const unsigned long now = millis();
+  usbStateChanged = false;
+  if (usbLastPollMs == 0 || now - usbLastPollMs >= USB_POLL_MS) {
+    usbLastPollMs = now;
+    const bool connected = isUsbConnected();
+    usbStateChanged = (connected != lastUsbConnected);
+    lastUsbConnected = connected;
+  }
 }
 
 bool HalGPIO::wasUsbStateChanged() const { return usbStateChanged; }
