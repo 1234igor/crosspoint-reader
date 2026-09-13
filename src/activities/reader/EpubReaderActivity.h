@@ -104,6 +104,19 @@ class EpubReaderActivity final : public ReaderActivity {
   int lastSavedSpineIndex = -1;
   int lastSavedPage = -1;
   int lastSavedPageCount = -1;
+  // Progress is persisted off the page-turn path: a turn only marks it dirty,
+  // and loop() writes it once the reader has been idle for
+  // PROGRESS_FLUSH_IDLE_MS (or the activity is torn down). ProgressFile's
+  // atomic write is five FAT operations, which used to run under the render
+  // lock on every turn.
+  bool progressDirty = false;
+  static constexpr unsigned long PROGRESS_FLUSH_IDLE_MS = 1500;
+  void flushProgress();
+  // Status-bar chapter title, resolved from book.bin once per spine index
+  // instead of two SD seeks on every page render.
+  mutable int statusTitleSpine = -1;
+  mutable uint8_t statusTitleMode = 0xFF;
+  mutable std::string statusTitle;
 
   static constexpr int BUILD_PAGES_PER_CHUNK = 8;
   static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 2;

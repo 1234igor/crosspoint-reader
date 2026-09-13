@@ -155,6 +155,8 @@ EpubReaderActivity::~EpubReaderActivity() {
   if (footnoteDepth > 0 && epub) {
     const SavedPosition& origin = savedPositions[0];
     saveProgress(origin.spineIndex, origin.pageNumber, 0);
+  } else {
+    flushProgress();
   }
 
   section.reset();
@@ -327,6 +329,12 @@ void EpubReaderActivity::loop() {
     applyOrientation(SETTINGS.orientation);
     requestUpdate();
     return;
+  }
+
+  if (progressDirty && !RenderLock::peek() && lastRenderCompleteMs != 0 &&
+      millis() - lastRenderCompleteMs > PROGRESS_FLUSH_IDLE_MS) {
+    RenderLock lock;
+    flushProgress();
   }
 
   constexpr unsigned long IDLE_PREWARM_DEBOUNCE_MS = 400;
@@ -1390,11 +1398,7 @@ void EpubReaderActivity::renderBook() {
 
   if (currentSpineIndex != lastSavedSpineIndex || section->currentPage != lastSavedPage ||
       section->pageCount != lastSavedPageCount) {
-    if (saveProgress(currentSpineIndex, section->currentPage, section->estimatedTotalPages())) {
-      lastSavedSpineIndex = currentSpineIndex;
-      lastSavedPage = section->currentPage;
-      lastSavedPageCount = section->estimatedTotalPages();
-    }
+    progressDirty = true;  // written by flushProgress() once the reader goes idle
   }
 
   showPendingSyncSaveError();
@@ -1471,6 +1475,16 @@ bool EpubReaderActivity::applyDeferredReposition() {
 void EpubReaderActivity::clearDeferredReposition() {
   cachedChapterTotalPageCount = 0;
   cachedVisibleTextOffset.reset();
+}
+
+void EpubReaderActivity::flushProgress() {
+  if (!progressDirty || !section || !epub) return;
+  if (saveProgress(currentSpineIndex, section->currentPage, section->estimatedTotalPages())) {
+    lastSavedSpineIndex = currentSpineIndex;
+    lastSavedPage = section->currentPage;
+    lastSavedPageCount = section->estimatedTotalPages();
+    progressDirty = false;
+  }
 }
 
 bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
@@ -1721,17 +1735,26 @@ void EpubReaderActivity::renderStatusBar() const {
     if (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight()) {
       textYOffset += UITheme::getInstance().getMetrics().statusBarVerticalMargin;
     }
-  } else if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
-    title = tr(STR_UNNAMED);
-    if (epub) {
-      const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
-      if (tocIndex != -1) {
-        const auto tocItem = epub->getTocItem(tocIndex);
-        title = tocItem.title;
+  } else if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE ||
+             sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::BOOK_TITLE) {
+    // Resolved once per spine index: the TOC lookup is two seeks into book.bin
+    // and the status bar is drawn on every page render (twice with AA).
+    if (statusTitleSpine != currentSpineIndex || statusTitleMode != static_cast<uint8_t>(sb.titleMode)) {
+      if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
+        statusTitle = tr(STR_UNNAMED);
+        if (epub) {
+          const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+          if (tocIndex != -1) {
+            statusTitle = epub->getTocItem(tocIndex).title;
+          }
+        }
+      } else {
+        statusTitle = epub ? epub->getTitle() : "";
       }
+      statusTitleSpine = currentSpineIndex;
+      statusTitleMode = static_cast<uint8_t>(sb.titleMode);
     }
-  } else if (sb.titleMode == CrossPointSettings::STATUS_BAR_TITLE::BOOK_TITLE) {
-    title = epub ? epub->getTitle() : "";
+    title = statusTitle;
   }
 
   GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, true, currentPageBookmarked,
