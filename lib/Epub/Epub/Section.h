@@ -73,6 +73,20 @@ class Section {
   // partial/finalized file stays readable while a rebuild is in progress.
   std::string binTmpPath() const { return filePath + ".part"; }
   std::unique_ptr<Page> loadPageAt(int page) const;
+  // Persistent read handle for loadPageAt: the committed section file is opened
+  // once per Section and read through a 2 KB read-ahead buffer, and both page
+  // LUTs are cached in RAM on first use, so a page turn costs one seek plus two
+  // or three SD reads instead of a path walk and ~1,500 tiny reads. Closed
+  // whenever the file on disk is about to be replaced or removed.
+  static constexpr size_t PAGE_READ_AHEAD = 2048;
+  static constexpr uint16_t PAGE_LUT_CACHE_MAX = 512;
+  mutable HalFile pageFile_;
+  mutable std::unique_ptr<uint8_t[]> pageBuf_;
+  mutable std::vector<uint32_t> pageOffsets_;     // page -> file offset of its serialized blob
+  mutable std::vector<uint32_t> visibleOffsets_;  // page -> visible-text start offset
+  mutable bool pageLutLoaded_ = false;
+  bool openPageFile() const;
+  void closePageFile() const;
   // Read a page already laid out by the in-progress build (page < build LUT size), from
   // the partially-written tmp .bin without disturbing the build's write cursor.
   std::unique_ptr<Page> loadPageDuringBuild(int page);

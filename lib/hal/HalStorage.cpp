@@ -1,5 +1,8 @@
 #include "HalStorage.h"
 
+#include <algorithm>
+#include <cstring>
+
 #include <FS.h>  // need to be included before SdFat.h for compatibility with FS.h's File class
 #include <Logging.h>
 #include <SDCardManager.h>
@@ -151,6 +154,12 @@ class HalFile::Impl {
     file.close();
   }
   FsFile file;
+  // Read-ahead state (see HalFile::setReadAhead). Caller-owned buffer.
+  uint8_t* ra = nullptr;
+  size_t raCap = 0;
+  size_t raStart = 0;  // file offset of ra[0]
+  size_t raFill = 0;   // valid bytes in ra
+  size_t raPos = 0;    // logical read position while ra != nullptr
 };
 
 HalFile::HalFile() = default;
@@ -227,21 +236,116 @@ size_t HalFile::getName(char* name, size_t len) { HAL_FILE_WRAPPED_CALL(getName,
 size_t HalFile::size() { HAL_FILE_FORWARD_CALL(size, ); }              // already thread-safe, no need to wrap
 size_t HalFile::fileSize() { HAL_FILE_FORWARD_CALL(fileSize, ); }      // already thread-safe, no need to wrap
 uint64_t HalFile::fileSize64() { HAL_FILE_FORWARD_CALL(fileSize, ); }  // already thread-safe, no need to wrap
-bool HalFile::seek(size_t pos) { HAL_FILE_WRAPPED_CALL(seekSet, pos); }
-bool HalFile::seek64(uint64_t pos) { HAL_FILE_WRAPPED_CALL(seekSet, pos); }
-bool HalFile::seekCur(int64_t offset) { HAL_FILE_WRAPPED_CALL(seekCur, offset); }
-bool HalFile::seekSet(size_t offset) { HAL_FILE_WRAPPED_CALL(seekSet, offset); }
-int HalFile::available() const { HAL_FILE_WRAPPED_CALL(available, ); }
-size_t HalFile::position() const { HAL_FILE_WRAPPED_CALL(position, ); }
-int HalFile::read(void* buf, size_t count) { HAL_FILE_WRAPPED_CALL(read, buf, count); }
-int HalFile::read() { HAL_FILE_WRAPPED_CALL(read, ); }
-size_t HalFile::write(const uint8_t* buf, size_t count) { HAL_FILE_WRAPPED_CALL(write, buf, count); }
-size_t HalFile::write(const void* buf, size_t count) { HAL_FILE_WRAPPED_CALL(write, buf, count); }
-size_t HalFile::write(uint8_t b) { HAL_FILE_WRAPPED_CALL(write, b); }
+void HalFile::setReadAhead(uint8_t* buf, size_t cap) {
+  HalStorage::StorageLock lock;
+  assert(impl != nullptr);
+  if (impl->ra) {
+    impl->file.seekSet(impl->raPos);  // hand the logical position back to SdFat
+  }
+  impl->ra = (buf != nullptr && cap > 0) ? buf : nullptr;
+  impl->raCap = impl->ra ? cap : 0;
+  impl->raStart = 0;
+  impl->raFill = 0;
+  impl->raPos = impl->file.position();
+}
+
+bool HalFile::seek(size_t pos) {
+  assert(impl != nullptr);
+  if (impl->ra) {
+    if (pos > impl->file.fileSize()) return false;
+    impl->raPos = pos;  // lazy: the buffer is (re)filled on the next read
+    return true;
+  }
+  HAL_FILE_WRAPPED_CALL(seekSet, pos);
+}
+bool HalFile::seek64(uint64_t pos) { return seek(static_cast<size_t>(pos)); }
+bool HalFile::seekCur(int64_t offset) {
+  assert(impl != nullptr);
+  if (impl->ra) return seek(static_cast<size_t>(static_cast<int64_t>(impl->raPos) + offset));
+  HAL_FILE_WRAPPED_CALL(seekCur, offset);
+}
+bool HalFile::seekSet(size_t offset) { return seek(offset); }
+int HalFile::available() const {
+  assert(impl != nullptr);
+  if (impl->ra) {
+    const size_t sz = impl->file.fileSize();
+    return impl->raPos < sz ? static_cast<int>(sz - impl->raPos) : 0;
+  }
+  HAL_FILE_WRAPPED_CALL(available, );
+}
+size_t HalFile::position() const {
+  assert(impl != nullptr);
+  if (impl->ra) return impl->raPos;
+  HAL_FILE_WRAPPED_CALL(position, );
+}
+int HalFile::read(void* buf, size_t count) {
+  assert(impl != nullptr);
+  if (!impl->ra) {
+    HAL_FILE_WRAPPED_CALL(read, buf, count);
+  }
+  HalStorage::StorageLock lock;
+  auto* out = static_cast<uint8_t*>(buf);
+  size_t done = 0;
+  while (done < count) {
+    if (impl->raFill > 0 && impl->raPos >= impl->raStart && impl->raPos < impl->raStart + impl->raFill) {
+      const size_t off = impl->raPos - impl->raStart;
+      const size_t n = std::min(count - done, impl->raFill - off);
+      memcpy(out + done, impl->ra + off, n);
+      done += n;
+      impl->raPos += n;
+      continue;
+    }
+    if (!impl->file.seekSet(impl->raPos)) break;
+    if (count - done >= impl->raCap) {
+      // Bulk read: straight through, no point staging it in the buffer.
+      const int n = impl->file.read(out + done, count - done);
+      if (n <= 0) break;
+      done += static_cast<size_t>(n);
+      impl->raPos += static_cast<size_t>(n);
+      break;
+    }
+    const int n = impl->file.read(impl->ra, impl->raCap);
+    if (n <= 0) {
+      impl->raFill = 0;
+      break;
+    }
+    impl->raStart = impl->raPos;
+    impl->raFill = static_cast<size_t>(n);
+  }
+  return static_cast<int>(done);
+}
+int HalFile::read() {
+  assert(impl != nullptr);
+  if (impl->ra) {
+    uint8_t b = 0;
+    return read(&b, 1) == 1 ? b : -1;
+  }
+  HAL_FILE_WRAPPED_CALL(read, );
+}
+size_t HalFile::write(const uint8_t* buf, size_t count) {
+  assert(impl != nullptr);
+  if (impl->ra) {
+    HalStorage::StorageLock lock;
+    impl->file.seekSet(impl->raPos);
+    const size_t n = impl->file.write(buf, count);
+    impl->raPos += n;
+    impl->raFill = 0;  // stale after a write
+    return n;
+  }
+  HAL_FILE_WRAPPED_CALL(write, buf, count);
+}
+size_t HalFile::write(const void* buf, size_t count) { return write(static_cast<const uint8_t*>(buf), count); }
+size_t HalFile::write(uint8_t b) { return write(&b, 1); }
 bool HalFile::rename(const char* newPath) { HAL_FILE_WRAPPED_CALL(rename, newPath); }
 bool HalFile::isDirectory() const { HAL_FILE_FORWARD_CALL(isDirectory, ); }  // already thread-safe, no need to wrap
 void HalFile::rewindDirectory() { HAL_FILE_WRAPPED_CALL(rewindDirectory, ); }
-bool HalFile::close() { HAL_FILE_WRAPPED_CALL(close, ); }
+bool HalFile::close() {
+  assert(impl != nullptr);
+  impl->ra = nullptr;
+  impl->raCap = 0;
+  impl->raFill = 0;
+  HAL_FILE_WRAPPED_CALL(close, );
+}
 HalFile HalFile::openNextFile() {
   HalStorage::StorageLock lock;
   assert(impl != nullptr);

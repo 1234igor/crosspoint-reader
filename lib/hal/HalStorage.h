@@ -115,6 +115,16 @@ class HalFile : public Print {
   HalFile openNextFile();
   bool isOpen() const;
   operator bool() const;
+
+  // Optional read-ahead through a caller-owned buffer. While enabled, read()
+  // serves from `buf` and refills it with one SdFat read of `cap` bytes, and
+  // seek()/position()/available() track a logical position instead of
+  // touching the card; reads larger than `cap` go straight through. This
+  // turns the hundreds of 1-4 byte pod reads of a deserialize pass into a
+  // handful of sector reads. The buffer must outlive the enabled state; pass
+  // nullptr to disable (the logical position is handed back to SdFat).
+  // Writes are honored (buffer invalidated) but the file is meant to be read.
+  void setReadAhead(uint8_t* buf, size_t cap);
 };
 
 // Downstream code must use Storage instead of SdMan

@@ -142,6 +142,7 @@ void Section::writeSectionFileHeader(const ReaderRenderSpec& spec) {
 }
 
 bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
+  closePageFile();
   if (!Storage.openFileForRead("SCT", filePath, file)) {
     return false;
   }
@@ -228,6 +229,7 @@ bool Section::loadSectionFile(const ReaderRenderSpec& spec) {
 
 // Your updated class method (assuming you are using the 'SD' object, which is a wrapper for a specific filesystem)
 bool Section::clearCache() const {
+  closePageFile();
   const std::string tmpBin = binTmpPath();
   if (Storage.exists(tmpBin.c_str())) {
     Storage.remove(tmpBin.c_str());
@@ -619,6 +621,7 @@ bool Section::commitBuildFile(const uint8_t version, const uint32_t bytesConsume
 
   // Swap into place. A crash between remove and rename loses the old file but keeps a
   // fully-committed tmp; the next build just removes it and rebuilds.
+  closePageFile();
   if (Storage.exists(filePath.c_str())) {
     Storage.remove(filePath.c_str());
   }
@@ -748,39 +751,89 @@ std::unique_ptr<Page> Section::loadPageDuringBuild(const int page) {
 // Read a page from the committed file at filePath (finalized section or partial from a
 // previous session). Uses a local handle so it is safe while a build holds the member
 // `file` open on the tmp .bin.
+void Section::closePageFile() const {
+  if (pageFile_) pageFile_.close();
+  pageLutLoaded_ = false;
+  pageOffsets_.clear();
+  visibleOffsets_.clear();
+}
+
+bool Section::openPageFile() const {
+  if (pageFile_) return true;
+  if (!Storage.openFileForRead("SCT", filePath, pageFile_)) {
+    return false;
+  }
+  if (!pageBuf_) pageBuf_ = makeUniqueNoThrow<uint8_t[]>(PAGE_READ_AHEAD);
+  if (pageBuf_) pageFile_.setReadAhead(pageBuf_.get(), PAGE_READ_AHEAD);
+
+  // Cache both page LUTs. They sit after the pages, one uint32 per page, sized by the
+  // on-disk page count (a partial's watermark, or the finalized total).
+  pageLutLoaded_ = false;
+  const uint16_t onDisk = partial_ ? partialPageCount_ : pageCount;
+  if (onDisk > 0 && onDisk <= PAGE_LUT_CACHE_MAX) {
+    HalFile& f = pageFile_;
+    uint32_t lutOffset = 0;
+    uint32_t visibleLutOffset = 0;
+    f.seek(HEADER_SIZE - sizeof(uint32_t) * 5);
+    serialization::readPod(f, lutOffset);
+    f.seek(HEADER_SIZE - sizeof(uint32_t));
+    serialization::readPod(f, visibleLutOffset);
+    const size_t bytes = sizeof(uint32_t) * onDisk;
+    const size_t fileSize = f.size();
+    if (lutOffset >= HEADER_SIZE && lutOffset + bytes <= fileSize) {
+      pageOffsets_.resize(onDisk);
+      f.seek(lutOffset);
+      pageLutLoaded_ = f.read(pageOffsets_.data(), bytes) == static_cast<int>(bytes);
+      if (pageLutLoaded_ && visibleLutOffset >= HEADER_SIZE && visibleLutOffset + bytes <= fileSize) {
+        visibleOffsets_.resize(onDisk);
+        f.seek(visibleLutOffset);
+        if (f.read(visibleOffsets_.data(), bytes) != static_cast<int>(bytes)) visibleOffsets_.clear();
+      }
+      if (!pageLutLoaded_) pageOffsets_.clear();
+    }
+  }
+  return true;
+}
+
 std::unique_ptr<Page> Section::loadPageAt(const int page) const {
-  HalFile f;
-  if (!Storage.openFileForRead("SCT", filePath, f)) {
+  if (!openPageFile()) {
     return nullptr;
   }
+  HalFile& f = pageFile_;
 
-  f.seek(HEADER_SIZE - sizeof(uint32_t) * 5);
-  uint32_t lutOffset;
-  serialization::readPod(f, lutOffset);
-  f.seek(lutOffset + sizeof(uint32_t) * page);
-  uint32_t pagePos;
-  serialization::readPod(f, pagePos);
-
-  // Read this page's visible-codepoint start offset from the visible-offset LUT (last header slot)
-  // in the same open handle, so the reader can persist progress without reopening the section file
-  // on every page turn (see Page::visibleTextOffset). A malformed/old file leaves it at 0.
-  f.seek(HEADER_SIZE - sizeof(uint32_t));
-  uint32_t visibleLutOffset;
-  serialization::readPod(f, visibleLutOffset);
+  uint32_t pagePos = 0;
   uint32_t visibleTextOffset = 0;
-  const uint32_t visibleEntry = visibleLutOffset + sizeof(uint32_t) * page;
-  if (visibleLutOffset >= HEADER_SIZE && visibleEntry + sizeof(uint32_t) <= f.size()) {
-    f.seek(visibleEntry);
-    serialization::readPod(f, visibleTextOffset);
+  if (pageLutLoaded_ && page < static_cast<int>(pageOffsets_.size())) {
+    pagePos = pageOffsets_[page];
+    if (page < static_cast<int>(visibleOffsets_.size())) visibleTextOffset = visibleOffsets_[page];
+  } else {
+    f.seek(HEADER_SIZE - sizeof(uint32_t) * 5);
+    uint32_t lutOffset;
+    serialization::readPod(f, lutOffset);
+    f.seek(lutOffset + sizeof(uint32_t) * page);
+    serialization::readPod(f, pagePos);
+
+    // Read this page's visible-codepoint start offset from the visible-offset LUT (last header
+    // slot) so the reader can persist progress without reopening the section file on every
+    // page turn (see Page::visibleTextOffset). A malformed/old file leaves it at 0.
+    f.seek(HEADER_SIZE - sizeof(uint32_t));
+    uint32_t visibleLutOffset;
+    serialization::readPod(f, visibleLutOffset);
+    const uint32_t visibleEntry = visibleLutOffset + sizeof(uint32_t) * page;
+    if (visibleLutOffset >= HEADER_SIZE && visibleEntry + sizeof(uint32_t) <= f.size()) {
+      f.seek(visibleEntry);
+      serialization::readPod(f, visibleTextOffset);
+    }
   }
 
   f.seek(pagePos);
   auto p = Page::deserialize(f);
-  if (p) {
-    p->visibleTextOffset = visibleTextOffset;
+  if (!p) {
+    closePageFile();  // don't trust the handle after a failed read; reopen next time
+    return nullptr;
   }
+  p->visibleTextOffset = visibleTextOffset;
   return p;
-  // No f.close() needed -- DESTRUCTOR_CLOSES_FILE=1 handles it at scope exit
 }
 
 std::unique_ptr<Page> Section::loadPage(const int page) {
