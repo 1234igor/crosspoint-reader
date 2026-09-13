@@ -126,6 +126,12 @@ class EpubReaderActivity final : public ReaderActivity {
   bool buildHeapPaused = false;
   static constexpr size_t RENDER_MIN_FREE_HEAP = 24 * 1024;
   static constexpr int BUILD_WINDOW_AHEAD = 5;
+  // Once the reader has sat on a page this long, keep laying out the rest of the
+  // chapter in the background (beyond BUILD_WINDOW_AHEAD) so a backward chapter
+  // turn or a resume after sleep lands on a finalized section file instead of a
+  // synchronous rebuild.
+  static constexpr unsigned long IDLE_BUILD_DELAY_MS = 1000;
+  bool idleBuildDue() const { return lastRenderCompleteMs != 0 && millis() - lastRenderCompleteMs > IDLE_BUILD_DELAY_MS; }
   static constexpr int PARTIAL_REBUILD_START_MARGIN = 15;
   static constexpr int BUILD_POPUP_PAGE_THRESHOLD = 20;
   static constexpr size_t BUILD_POPUP_BYTE_THRESHOLD = 96 * 1024;

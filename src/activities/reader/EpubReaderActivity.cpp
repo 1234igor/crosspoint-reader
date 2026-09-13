@@ -377,7 +377,8 @@ void EpubReaderActivity::loop() {
   }
 
   if (section && section->isBuilding() && !RenderLock::peek() &&
-      (section->isPartial() || static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD) &&
+      (section->isPartial() || static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD ||
+       idleBuildDue()) &&
       buildTickHeapGate()) {
     RenderLock lock;
     if (section->isBuilding() && buildTickHeapGate()) {
@@ -1104,7 +1105,8 @@ void EpubReaderActivity::onReturnFromEndOfBook() {
 
 bool EpubReaderActivity::skipLoopDelay() {
   return section && section->isBuilding() && !buildHeapPaused &&
-         (section->isPartial() || static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD);
+         (section->isPartial() || static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD ||
+          idleBuildDue());
 }
 
 void EpubReaderActivity::renderBook() {
