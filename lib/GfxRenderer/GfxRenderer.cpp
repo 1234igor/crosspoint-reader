@@ -1,5 +1,7 @@
 #include "GfxRenderer.h"
 
+#include "GlyphBlit.h"
+
 #include <BidiUtils.h>
 #include <BoardConfig.h>
 #include <BuildScratch.h>
@@ -491,65 +493,46 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
       innerBase = cursorX + left;  // screenX = innerBase + glyphX
     }
 
-    if (is2Bit) {
-      int pixelPosition = 0;
-      for (int glyphY = 0; glyphY < height; glyphY++) {
-        const int outerCoord = outerBase + glyphY;
-        for (int glyphX = 0; glyphX < width; glyphX++, pixelPosition++) {
-          int screenX, screenY;
-          if constexpr (rotation == TextRotation::Rotated90CW) {
-            screenX = outerCoord;
-            screenY = innerBase - glyphX;
-          } else {
-            screenX = innerBase + glyphX;
-            screenY = outerCoord;
-          }
-
-          const uint8_t byte = bitmap[pixelPosition >> 2];
-          const uint8_t bit_index = (3 - (pixelPosition & 3)) * 2;
-          // the direct bit from the font is 0 -> white, 1 -> light gray, 2 -> dark gray, 3 -> black
-          // we swap this to better match the way images and screen think about colors:
-          // 0 -> black, 1 -> dark grey, 2 -> light grey, 3 -> white
-          const uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
-
-          if (renderMode == GfxRenderer::BW && bmpVal < 3) {
-            // Black (also paints over the grays in BW mode)
-            renderer.drawPixel(screenX, screenY, pixelState);
-          } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (bmpVal == 1 || bmpVal == 2)) {
-            // Light gray (also mark the MSB if it's going to be a dark gray too)
-            // Dedicated X3 gray LUTs now provide proper 4-level gray on both devices
-            // We have to flag pixels in reverse for the gray buffers, as 0 leave alone, 1 update
-            renderer.drawPixel(screenX, screenY, false);
-          } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && bmpVal == 1) {
-            // Dark gray
-            renderer.drawPixel(screenX, screenY, false);
-          }
-        }
-      }
-    } else {
-      int pixelPosition = 0;
-      for (int glyphY = 0; glyphY < height; glyphY++) {
-        const int outerCoord = outerBase + glyphY;
-        for (int glyphX = 0; glyphX < width; glyphX++, pixelPosition++) {
-          int screenX, screenY;
-          if constexpr (rotation == TextRotation::Rotated90CW) {
-            screenX = outerCoord;
-            screenY = innerBase - glyphX;
-          } else {
-            screenX = innerBase + glyphX;
-            screenY = outerCoord;
-          }
-
-          const uint8_t byte = bitmap[pixelPosition >> 3];
-          const uint8_t bit_index = 7 - (pixelPosition & 7);
-
-          if ((byte >> bit_index) & 1) {
-            renderer.drawPixel(screenX, screenY, pixelState);
-          }
-        }
-      }
+    // Glyph values (after the 3 - raw swap): 0 black, 1 dark gray, 2 light gray, 3 white.
+    //   BW pass draws everything but white (grays are painted black, the gray
+    //   planes refine them); the MSB plane flags both grays, the LSB plane dark
+    //   gray only. Gray planes mark pixels by SETTING the bit (state=false).
+    // 1-bit glyphs draw their set bits with pixelState in every mode (as before).
+    uint8_t drawMask = 0;
+    bool state = pixelState;
+    if (!is2Bit) {
+      drawMask = 0x0F;
+    } else if (renderMode == GfxRenderer::BW) {
+      drawMask = 0x07;
+    } else if (renderMode == GfxRenderer::GRAYSCALE_MSB) {
+      drawMask = 0x06;
+      state = false;
+    } else {  // GRAYSCALE_LSB
+      drawMask = 0x02;
+      state = false;
     }
+    // For Normal:  screen = (innerBase + glyphX, outerBase + glyphY)
+    // For Rotated: screen = (outerBase + glyphY, innerBase - glyphX)
+    constexpr bool rotated90 = rotation == TextRotation::Rotated90CW;
+    const int screenX0 = rotated90 ? outerBase : innerBase;
+    const int screenY0 = rotated90 ? innerBase : outerBase;
+    renderer.blitGlyph(bitmap, is2Bit, width, height, screenX0, screenY0, rotated90, drawMask, state);
   }
+}
+
+void GfxRenderer::blitGlyph(const uint8_t* bitmap, const bool is2Bit, const int width, const int height,
+                            const int screenX0, const int screenY0, const bool rotated90, const uint8_t drawMask,
+                            const bool state) const {
+  glyphblit::Target target;
+  target.buf = getWriteTarget();
+  target.panelW = panelWidth;
+  target.panelH = panelHeight;
+  target.widthBytes = panelWidthBytes;
+  target.rowOrigin = getWriteOriginY();
+  target.rows = getWriteRows();
+  target.orient = static_cast<glyphblit::Orient>(orientation);
+  if (!target.buf) return;
+  glyphblit::blit(target, bitmap, is2Bit, width, height, screenX0, screenY0, rotated90, drawMask, state);
 }
 
 // IMPORTANT: This function is in critical rendering path and is called for every pixel. Please keep it as simple and

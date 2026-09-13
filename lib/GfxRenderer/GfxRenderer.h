@@ -252,6 +252,11 @@ class GfxRenderer {
 
   // Drawing
   void drawPixel(int x, int y, bool state = true) const;
+  // Fast glyph blit (see GlyphBlit.h): resolves orientation, strip band and
+  // bounds once per glyph instead of per pixel. Same pixel results as calling
+  // drawPixel() for every ink pixel, including strip clipping.
+  void blitGlyph(const uint8_t* bitmap, bool is2Bit, int width, int height, int screenX0, int screenY0,
+                 bool rotated90, uint8_t drawMask, bool state) const;
   void drawLine(int x1, int y1, int x2, int y2, bool state = true) const;
   void drawLine(int x1, int y1, int x2, int y2, int lineWidth, bool state) const;
   void drawArc(int maxRadius, int cx, int cy, int xDir, int yDir, int lineWidth, bool state) const;
