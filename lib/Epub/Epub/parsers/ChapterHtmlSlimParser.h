@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+struct ImageDimensions;  // Epub/converters/ImageToFramebufferDecoder.h
+
 #include "Epub/FootnoteEntry.h"
 #include "Epub/ParsedText.h"
 #include "Epub/blocks/ImageBlock.h"
@@ -61,6 +63,25 @@ class ChapterHtmlSlimParser {
   std::string contentBase;
   std::string imageBasePath;
   int imageCounter = 0;
+
+  // Image dimension memo (<cache dir>/imgdims.bin, href hash -> width/height).
+  // Probing an image's header means a fresh ZIP central-directory lookup plus
+  // a 43 KB inflate allocation per <img>; with the memo a book's images are
+  // probed once ever, so re-paginations (font/margin changes) and rebuilds
+  // skip that entirely. Loaded on the first <img>, appended in RAM, written
+  // back once by the destructor if anything was added.
+  struct ImgDimRec {
+    uint64_t hash;
+    uint16_t width;
+    uint16_t height;
+  };
+  std::vector<ImgDimRec> imgDims_;
+  bool imgDimsLoaded_ = false;
+  bool imgDimsDirty_ = false;
+  std::string imgDimsPath() const;
+  bool lookupImgDims(const std::string& href, ImageDimensions& out);
+  void rememberImgDims(const std::string& href, const ImageDimensions& dims);
+  void flushImgDims();
 
   // Style tracking (replaces depth-based approach)
   struct StyleStackEntry {

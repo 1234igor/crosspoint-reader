@@ -7,6 +7,7 @@
 #include <Memory.h>
 #include <Utf8.h>
 #include <XmlParserUtils.h>
+#include <ZipFile.h>
 #include <expat.h>
 
 #include <algorithm>
@@ -964,9 +965,13 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
               // ImageBlock's lazy extractor). This is what keeps first-open of an
               // image-heavy chapter from stalling for seconds per image.
               ImageDimensions dims = {0, 0};
-              ImageDimsProbe headerProbe;
-              self->epub->readItemContentsToStream(resolvedPath, headerProbe, 1024, /*allowEarlyStop=*/true);
-              bool gotDimensions = headerProbe.getDimensions(dims);
+              bool gotDimensions = self->lookupImgDims(resolvedPath, dims);
+              const bool probed = !gotDimensions;
+              if (!gotDimensions) {
+                ImageDimsProbe headerProbe;
+                self->epub->readItemContentsToStream(resolvedPath, headerProbe, 1024, /*allowEarlyStop=*/true);
+                gotDimensions = headerProbe.getDimensions(dims);
+              }
 
               if (!gotDimensions) {
                 // No header within the stream (rare) — fall back to extracting the
@@ -998,6 +1003,9 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 }
               }
 
+              if (gotDimensions && probed) {
+                self->rememberImgDims(resolvedPath, dims);
+              }
               if (gotDimensions) {
                 LOG_DBG("EHP", "Image dimensions: %dx%d", dims.width, dims.height);
 
@@ -1962,7 +1970,60 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
   }
 }
 
-ChapterHtmlSlimParser::~ChapterHtmlSlimParser() { abortParse(); }
+ChapterHtmlSlimParser::~ChapterHtmlSlimParser() {
+  abortParse();
+  flushImgDims();
+}
+
+// --- Image dimension memo ---
+
+namespace {
+constexpr size_t IMG_DIMS_MAX_RECORDS = 1024;
+}
+
+std::string ChapterHtmlSlimParser::imgDimsPath() const { return epub->getCachePath() + "/imgdims.bin"; }
+
+bool ChapterHtmlSlimParser::lookupImgDims(const std::string& href, ImageDimensions& out) {
+  if (!imgDimsLoaded_) {
+    imgDimsLoaded_ = true;
+    const std::string path = imgDimsPath();
+    HalFile f;
+    if (Storage.exists(path.c_str()) && Storage.openFileForRead("EHP", path, f)) {
+      const size_t count = std::min(f.size() / sizeof(ImgDimRec), IMG_DIMS_MAX_RECORDS);
+      if (count > 0) {
+        imgDims_.resize(count);
+        const size_t bytes = count * sizeof(ImgDimRec);
+        if (f.read(imgDims_.data(), bytes) != static_cast<int>(bytes)) imgDims_.clear();
+      }
+    }
+  }
+  const uint64_t hash = ZipFile::fnvHash64(href.data(), href.size());
+  for (const auto& rec : imgDims_) {
+    if (rec.hash == hash) {
+      out.width = static_cast<int16_t>(rec.width);
+      out.height = static_cast<int16_t>(rec.height);
+      return out.width > 0 && out.height > 0;
+    }
+  }
+  return false;
+}
+
+void ChapterHtmlSlimParser::rememberImgDims(const std::string& href, const ImageDimensions& dims) {
+  if (dims.width <= 0 || dims.height <= 0 || imgDims_.size() >= IMG_DIMS_MAX_RECORDS) return;
+  imgDims_.push_back({ZipFile::fnvHash64(href.data(), href.size()), static_cast<uint16_t>(dims.width),
+                      static_cast<uint16_t>(dims.height)});
+  imgDimsDirty_ = true;
+}
+
+void ChapterHtmlSlimParser::flushImgDims() {
+  if (!imgDimsDirty_ || imgDims_.empty() || !epub) return;
+  imgDimsDirty_ = false;
+  HalFile f;
+  if (!Storage.openFileForWrite("EHP", imgDimsPath(), f)) return;
+  f.write(imgDims_.data(), imgDims_.size() * sizeof(ImgDimRec));
+  f.flush();
+  f.close();
+}
 
 bool ChapterHtmlSlimParser::beginParse() {
   htmlEnded_ = false;
