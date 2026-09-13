@@ -23,6 +23,8 @@ class Epub {
   std::string contentBasePath;
   // Uniq cache key based on filepath
   std::string cachePath;
+  // Sorted central-directory index for this book (ZipFile::buildIndex), in the cache dir.
+  std::string zipIndexPath() const { return cachePath + "/zip.idx"; }
   // Spine and TOC cache
   std::unique_ptr<BookMetadataCache> bookMetadataCache;
   // CSS parser for styling

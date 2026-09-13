@@ -2,6 +2,7 @@
 #include <HalStorage.h>
 
 #include <deque>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -41,7 +42,37 @@ class ZipFile {
  private:
   const std::string& filePath;
   HalFile file;
+  // Read-ahead for the central-directory walks: each entry is ~12 tiny reads,
+  // which this turns into memcpy from one 512-byte SD read. Data reads of a
+  // chunk size >= 512 bypass the buffer (see HalFile::setReadAhead). Heap,
+  // not stack: ZipFile is built on the stack inside expat callbacks on the
+  // 8 KB render task.
+  static constexpr size_t SCAN_BUF_SIZE = 512;
+  std::unique_ptr<uint8_t[]> scanBuf_;
   ZipDetails zipDetails = {0, 0, false};
+
+  // Persistent central-directory index (see buildIndex). Records sorted by
+  // (hash, nameLen); a lookup is a binary search over the file plus one name
+  // verification read, instead of a linear walk of the central directory.
+  struct IndexHeader {
+    uint32_t magic;
+    uint32_t zipSize;
+    uint16_t entries;
+    uint16_t reserved;
+  };
+  struct IndexRec {
+    uint64_t hash;
+    uint32_t cdOffset;  // central-directory entry offset, for name verification
+    uint32_t localHeaderOffset;
+    uint32_t compressedSize;
+    uint32_t uncompressedSize;
+    uint16_t method;
+    uint16_t nameLen;
+  };
+  static constexpr uint32_t INDEX_MAGIC = 0x58444943;  // "CIDX"
+  std::string indexPath_;
+  enum class IndexLookup { Found, NotFound, Unavailable };
+  IndexLookup lookupIndex(const char* filename, FileStatSlim* fileStat);
   std::unordered_map<std::string, FileStatSlim> fileStatSlimCache;
 
   // Cursor for sequential central-dir scanning optimization
@@ -54,7 +85,13 @@ class ZipFile {
 
  public:
   explicit ZipFile(const std::string& filePath) : filePath(filePath) {}
+  // indexPath: where buildIndex() wrote (or will write) this zip's index.
+  ZipFile(const std::string& filePath, std::string indexPath) : filePath(filePath), indexPath_(std::move(indexPath)) {}
   ~ZipFile() = default;
+  // Scan the central directory once and write the sorted index to indexPath_.
+  // Validated on use against the zip's size and entry count, so a replaced
+  // book silently falls back to the linear scan until it is re-indexed.
+  bool buildIndex();
   // Zip file can be opened and closed by hand in order to allow for quick calculation of inflated file size
   // It is NOT recommended to pre-open it for any kind of inflation due to memory constraints
   bool isOpen() const { return !!file; }

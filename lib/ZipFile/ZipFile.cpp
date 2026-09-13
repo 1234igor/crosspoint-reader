@@ -5,6 +5,15 @@
 #include <Logging.h>
 
 #include <algorithm>
+#include <cstring>
+#include <new>
+
+// Layout-compatible view of ZipFile::IndexRec for the qsort comparator (IndexRec is private).
+struct ZipFile_IndexRecView {
+  uint64_t hash;
+  uint32_t cdOffset, localHeaderOffset, compressedSize, uncompressedSize;
+  uint16_t method, nameLen;
+};
 
 struct ZipInflateCtx {
   HalFile* file = nullptr;
@@ -126,6 +135,17 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
   if (!zip) return false;
 
   if (!loadZipDetails()) return false;
+
+  if (!indexPath_.empty()) {
+    switch (lookupIndex(filename, fileStat)) {
+      case IndexLookup::Found:
+        return true;
+      case IndexLookup::NotFound:
+        return false;  // the index is valid and complete: no need to scan
+      case IndexLookup::Unavailable:
+        break;  // no/stale index: fall through to the scan
+    }
+  }
 
   // Phase 1: Try scanning from cursor position first
   uint32_t startPos = lastCentralDirPosValid ? lastCentralDirPos : zipDetails.centralDirOffset;
@@ -274,10 +294,141 @@ bool ZipFile::loadZipDetails() {
   return true;
 }
 
+namespace {
+int compareIndexRec(const void* a, const void* b) {
+  const auto* ra = static_cast<const ZipFile_IndexRecView*>(a);
+  const auto* rb = static_cast<const ZipFile_IndexRecView*>(b);
+  if (ra->hash != rb->hash) return ra->hash < rb->hash ? -1 : 1;
+  if (ra->nameLen != rb->nameLen) return ra->nameLen < rb->nameLen ? -1 : 1;
+  return 0;
+}
+}  // namespace
+
+bool ZipFile::buildIndex() {
+  if (indexPath_.empty()) return false;
+  const ScopedOpenClose zip{*this};
+  if (!zip) return false;
+  if (!loadZipDetails()) return false;
+
+  const uint16_t total = zipDetails.totalEntries;
+  if (total == 0) return false;
+  auto* recs = static_cast<IndexRec*>(malloc(sizeof(IndexRec) * total));
+  if (!recs) {
+    LOG_ERR("ZIP", "No memory for zip index (%u entries)", total);
+    return false;
+  }
+
+  file.seek(zipDetails.centralDirOffset);
+  uint16_t count = 0;
+  char itemName[256];
+  while (count < total && file.available()) {
+    const uint32_t entryStart = file.position();
+    uint32_t sig = 0;
+    if (file.read(&sig, 4) != 4 || sig != 0x02014b50) break;
+    IndexRec& r = recs[count];
+    file.seekCur(6);
+    file.read(&r.method, 2);
+    file.seekCur(8);
+    file.read(&r.compressedSize, 4);
+    file.read(&r.uncompressedSize, 4);
+    uint16_t m, k;
+    file.read(&r.nameLen, 2);
+    file.read(&m, 2);
+    file.read(&k, 2);
+    file.seekCur(8);
+    file.read(&r.localHeaderOffset, 4);
+    r.cdOffset = entryStart;
+    if (r.nameLen < 256) {
+      file.read(itemName, r.nameLen);
+      r.hash = fnvHash64(itemName, r.nameLen);
+      count++;
+    } else {
+      file.seekCur(r.nameLen);  // unindexed: the scan still finds it
+    }
+    file.seekCur(m + k);
+  }
+
+  qsort(recs, count, sizeof(IndexRec), compareIndexRec);
+
+  bool ok = false;
+  const std::string tmpPath = indexPath_ + ".tmp";
+  HalFile out;
+  if (Storage.openFileForWrite("ZIP", tmpPath, out)) {
+    const IndexHeader header = {INDEX_MAGIC, static_cast<uint32_t>(file.size()), count, 0};
+    ok = out.write(&header, sizeof(header)) == sizeof(header) &&
+         out.write(recs, sizeof(IndexRec) * count) == sizeof(IndexRec) * count;
+    out.flush();
+    out.close();
+    if (ok) {
+      Storage.remove(indexPath_.c_str());
+      ok = Storage.rename(tmpPath.c_str(), indexPath_.c_str());
+    }
+    if (!ok) Storage.remove(tmpPath.c_str());
+  }
+  free(recs);
+  LOG_DBG("ZIP", "Indexed %u/%u zip entries -> %s (%s)", count, total, indexPath_.c_str(), ok ? "ok" : "FAILED");
+  return ok;
+}
+
+ZipFile::IndexLookup ZipFile::lookupIndex(const char* filename, FileStatSlim* fileStat) {
+  HalFile idx;
+  if (!Storage.exists(indexPath_.c_str()) || !Storage.openFileForRead("ZIP", indexPath_, idx)) {
+    return IndexLookup::Unavailable;
+  }
+  IndexHeader header = {};
+  if (idx.read(&header, sizeof(header)) != sizeof(header) || header.magic != INDEX_MAGIC ||
+      header.zipSize != static_cast<uint32_t>(file.size()) || header.entries == 0 ||
+      idx.size() < sizeof(IndexHeader) + sizeof(IndexRec) * header.entries) {
+    return IndexLookup::Unavailable;  // stale (book replaced) or corrupt: re-indexed on the next cold open
+  }
+
+  const size_t nameLen = strlen(filename);
+  const uint64_t hash = fnvHash64(filename, nameLen);
+  const auto readRec = [&](const int i, IndexRec& r) {
+    return idx.seek(sizeof(IndexHeader) + sizeof(IndexRec) * static_cast<size_t>(i)) &&
+           idx.read(&r, sizeof(r)) == sizeof(r);
+  };
+  const auto less = [&](const IndexRec& r) { return r.hash < hash || (r.hash == hash && r.nameLen < nameLen); };
+
+  // Lower bound over the sorted records.
+  int lo = 0;
+  int hi = header.entries;
+  IndexRec r = {};
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (!readRec(mid, r)) return IndexLookup::Unavailable;
+    if (less(r)) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  // Walk the run of equal (hash, nameLen) records and verify the name against
+  // the central directory, so a hash collision can never return a wrong entry.
+  char itemName[256];
+  for (int i = lo; i < header.entries; i++) {
+    if (!readRec(i, r)) return IndexLookup::Unavailable;
+    if (r.hash != hash || r.nameLen != nameLen) break;
+    if (!file.seek(r.cdOffset + 46) || file.read(itemName, r.nameLen) != static_cast<int>(r.nameLen)) {
+      return IndexLookup::Unavailable;
+    }
+    if (memcmp(itemName, filename, nameLen) == 0) {
+      fileStat->method = r.method;
+      fileStat->compressedSize = r.compressedSize;
+      fileStat->uncompressedSize = r.uncompressedSize;
+      fileStat->localHeaderOffset = r.localHeaderOffset;
+      return IndexLookup::Found;
+    }
+  }
+  return IndexLookup::NotFound;
+}
+
 bool ZipFile::open() {
   if (!Storage.openFileForRead("ZIP", filePath, file)) {
     return false;
   }
+  if (!scanBuf_) scanBuf_.reset(new (std::nothrow) uint8_t[SCAN_BUF_SIZE]);
+  if (scanBuf_) file.setReadAhead(scanBuf_.get(), SCAN_BUF_SIZE);
   return true;
 }
 
@@ -286,6 +437,7 @@ bool ZipFile::close() {
     // Explicit close() required: member variable persists beyond function scope
     file.close();
   }
+  scanBuf_.reset();
   lastCentralDirPos = 0;
   lastCentralDirPosValid = false;
   return true;
