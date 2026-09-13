@@ -1977,31 +1977,29 @@ ChapterHtmlSlimParser::~ChapterHtmlSlimParser() {
 
 // --- Image dimension memo ---
 
-namespace {
-constexpr size_t IMG_DIMS_MAX_RECORDS = 1024;
-}
-
 std::string ChapterHtmlSlimParser::imgDimsPath() const { return epub->getCachePath() + "/imgdims.bin"; }
 
 bool ChapterHtmlSlimParser::lookupImgDims(const std::string& href, ImageDimensions& out) {
   if (!imgDimsLoaded_) {
     imgDimsLoaded_ = true;
+    imgDims_ = makeUniqueNoThrow<ImgDimRec[]>(IMG_DIMS_MAX_RECORDS);  // 4 KB; nullptr = memo disabled
+    imgDimsCount_ = 0;
     const std::string path = imgDimsPath();
     HalFile f;
-    if (Storage.exists(path.c_str()) && Storage.openFileForRead("EHP", path, f)) {
-      const size_t count = std::min(f.size() / sizeof(ImgDimRec), IMG_DIMS_MAX_RECORDS);
-      if (count > 0) {
-        imgDims_.resize(count);
-        const size_t bytes = count * sizeof(ImgDimRec);
-        if (f.read(imgDims_.data(), bytes) != static_cast<int>(bytes)) imgDims_.clear();
+    if (imgDims_ && Storage.exists(path.c_str()) && Storage.openFileForRead("EHP", path, f)) {
+      const size_t count = std::min(f.size() / sizeof(ImgDimRec), static_cast<size_t>(IMG_DIMS_MAX_RECORDS));
+      const size_t bytes = count * sizeof(ImgDimRec);
+      if (count > 0 && f.read(imgDims_.get(), bytes) == static_cast<int>(bytes)) {
+        imgDimsCount_ = static_cast<uint16_t>(count);
       }
     }
   }
+  if (!imgDims_) return false;
   const uint64_t hash = ZipFile::fnvHash64(href.data(), href.size());
-  for (const auto& rec : imgDims_) {
-    if (rec.hash == hash) {
-      out.width = static_cast<int16_t>(rec.width);
-      out.height = static_cast<int16_t>(rec.height);
+  for (uint16_t i = 0; i < imgDimsCount_; i++) {
+    if (imgDims_[i].hash == hash) {
+      out.width = static_cast<int16_t>(imgDims_[i].width);
+      out.height = static_cast<int16_t>(imgDims_[i].height);
       return out.width > 0 && out.height > 0;
     }
   }
@@ -2009,18 +2007,18 @@ bool ChapterHtmlSlimParser::lookupImgDims(const std::string& href, ImageDimensio
 }
 
 void ChapterHtmlSlimParser::rememberImgDims(const std::string& href, const ImageDimensions& dims) {
-  if (dims.width <= 0 || dims.height <= 0 || imgDims_.size() >= IMG_DIMS_MAX_RECORDS) return;
-  imgDims_.push_back({ZipFile::fnvHash64(href.data(), href.size()), static_cast<uint16_t>(dims.width),
-                      static_cast<uint16_t>(dims.height)});
+  if (!imgDims_ || dims.width <= 0 || dims.height <= 0 || imgDimsCount_ >= IMG_DIMS_MAX_RECORDS) return;
+  imgDims_[imgDimsCount_++] = {ZipFile::fnvHash64(href.data(), href.size()), static_cast<uint16_t>(dims.width),
+                               static_cast<uint16_t>(dims.height)};
   imgDimsDirty_ = true;
 }
 
 void ChapterHtmlSlimParser::flushImgDims() {
-  if (!imgDimsDirty_ || imgDims_.empty() || !epub) return;
+  if (!imgDimsDirty_ || !imgDims_ || imgDimsCount_ == 0 || !epub) return;
   imgDimsDirty_ = false;
   HalFile f;
   if (!Storage.openFileForWrite("EHP", imgDimsPath(), f)) return;
-  f.write(imgDims_.data(), imgDims_.size() * sizeof(ImgDimRec));
+  f.write(imgDims_.get(), static_cast<size_t>(imgDimsCount_) * sizeof(ImgDimRec));
   f.flush();
   f.close();
 }

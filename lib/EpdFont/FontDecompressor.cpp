@@ -597,6 +597,11 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, const char* utf8
       if (getGroupIndex(fontData, slot.glyphs[i].glyphIndex) != groupIdx) continue;
 
       const EpdGlyph& glyph = fontData->glyph[slot.glyphs[i].glyphIndex];
+      if (writeOffset + glyph.dataLength > oldBytes + totalBytes) {
+        // Only reachable through an entry this call did not size for; never write past the buffer.
+        missed++;
+        continue;
+      }
       compactSingleGlyph(&tempBuf[slot.glyphs[i].alignedOffset], &slot.buffer[writeOffset], glyph.width, glyph.height);
       slot.glyphs[i].bufferOffset = writeOffset;
       writeOffset += glyph.dataLength;
@@ -605,6 +610,18 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, const char* utf8
     free(tempBuf);
   }
   slot.bufferBytes = writeOffset;
+
+  // Drop entries that were not extracted (a temp-group allocation or inflate
+  // failed). Slots now outlive the page, so a stale unextracted entry would
+  // otherwise be re-appended as a duplicate by the next page's missing-set
+  // pass and extracted into space that call never sized for. Order is kept.
+  uint16_t kept = 0;
+  for (uint16_t i = 0; i < slot.glyphCount; i++) {
+    if (slot.glyphs[i].bufferOffset == UINT32_MAX) continue;
+    if (kept != i) slot.glyphs[kept] = slot.glyphs[i];
+    kept++;
+  }
+  slot.glyphCount = kept;
 
   LOG_DBG("FDC", "Prewarm: +%u glyphs (%u resident) in %u bytes from %u groups (%d missed)", missingCount, oldCount,
           writeOffset, groupCount, missed);

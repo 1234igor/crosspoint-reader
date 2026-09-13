@@ -82,8 +82,11 @@ class Section {
   static constexpr uint16_t PAGE_LUT_CACHE_MAX = 512;
   mutable HalFile pageFile_;
   mutable std::unique_ptr<uint8_t[]> pageBuf_;
-  mutable std::vector<uint32_t> pageOffsets_;     // page -> file offset of its serialized blob
-  mutable std::vector<uint32_t> visibleOffsets_;  // page -> visible-text start offset
+  // Nothrow arrays (render task, -fno-exceptions): a failed allocation just
+  // means the per-page LUT reads stay on disk.
+  mutable std::unique_ptr<uint32_t[]> pageOffsets_;     // page -> file offset of its serialized blob
+  mutable std::unique_ptr<uint32_t[]> visibleOffsets_;  // page -> visible-text start offset (may be null)
+  mutable uint16_t pageLutCount_ = 0;
   mutable bool pageLutLoaded_ = false;
   bool openPageFile() const;
   void closePageFile() const;

@@ -75,7 +75,11 @@ class ChapterHtmlSlimParser {
     uint16_t width;
     uint16_t height;
   };
-  std::vector<ImgDimRec> imgDims_;
+  // Fixed nothrow array: chapter layout is the heaviest heap phase and a
+  // std::vector growth failure would abort() under -fno-exceptions.
+  static constexpr uint16_t IMG_DIMS_MAX_RECORDS = 256;
+  std::unique_ptr<ImgDimRec[]> imgDims_;
+  uint16_t imgDimsCount_ = 0;
   bool imgDimsLoaded_ = false;
   bool imgDimsDirty_ = false;
   std::string imgDimsPath() const;

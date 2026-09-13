@@ -75,13 +75,13 @@ class FontDecompressor {
   PageSlot pageSlots[MAX_PAGE_SLOTS] = {};
   uint8_t pageSlotCount = 0;
   uint32_t generation_ = 0;
-  // Retention budget. A body-text page is ~70 glyphs / ~2.5 KB in one style, so
-  // 6 KB per slot and 8 KB in total hold the working set of several pages
-  // without eating into the ~112 KB the reader wants free for its two tiled
-  // grayscale plane buffers. Past the budget the slot is rebuilt from scratch
-  // for the current page, exactly as before.
-  static constexpr uint32_t SLOT_RETAIN_MAX_BYTES = 6 * 1024;
-  static constexpr uint32_t TOTAL_RETAIN_MAX_BYTES = 8 * 1024;
+  // Retention budget. Past it the slot is rebuilt from scratch for the current
+  // page, exactly as before. Heap-critical phases (chapter layout, popups)
+  // still free everything through clearCache()/releaseSdFontCaches().
+  // (12 KB / 16 KB: a 16-18 pt page is ~100-130 B per glyph, ~7-9 KB for its
+  // working set, so 6/8 KB would rebuild every page at the larger sizes.)
+  static constexpr uint32_t SLOT_RETAIN_MAX_BYTES = 12 * 1024;
+  static constexpr uint32_t TOTAL_RETAIN_MAX_BYTES = 16 * 1024;
   void freeSlot(uint8_t index);
   uint32_t retainedBytes() const;
 

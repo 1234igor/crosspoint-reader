@@ -714,6 +714,7 @@ void Section::abandonBuild() {
   }
   // A parse error would recur against the same HTML, so drop any partial too -- resuming
   // from it would just re-enter the failing build every open.
+  closePageFile();
   if (Storage.exists(filePath.c_str())) {
     Storage.remove(filePath.c_str());
   }
@@ -754,8 +755,9 @@ std::unique_ptr<Page> Section::loadPageDuringBuild(const int page) {
 void Section::closePageFile() const {
   if (pageFile_) pageFile_.close();
   pageLutLoaded_ = false;
-  pageOffsets_.clear();
-  visibleOffsets_.clear();
+  pageLutCount_ = 0;
+  pageOffsets_.reset();
+  visibleOffsets_.reset();
 }
 
 bool Section::openPageFile() const {
@@ -781,15 +783,23 @@ bool Section::openPageFile() const {
     const size_t bytes = sizeof(uint32_t) * onDisk;
     const size_t fileSize = f.size();
     if (lutOffset >= HEADER_SIZE && lutOffset + bytes <= fileSize) {
-      pageOffsets_.resize(onDisk);
-      f.seek(lutOffset);
-      pageLutLoaded_ = f.read(pageOffsets_.data(), bytes) == static_cast<int>(bytes);
-      if (pageLutLoaded_ && visibleLutOffset >= HEADER_SIZE && visibleLutOffset + bytes <= fileSize) {
-        visibleOffsets_.resize(onDisk);
-        f.seek(visibleLutOffset);
-        if (f.read(visibleOffsets_.data(), bytes) != static_cast<int>(bytes)) visibleOffsets_.clear();
+      pageOffsets_ = makeUniqueNoThrow<uint32_t[]>(onDisk);
+      if (pageOffsets_) {
+        f.seek(lutOffset);
+        pageLutLoaded_ = f.read(pageOffsets_.get(), bytes) == static_cast<int>(bytes);
       }
-      if (!pageLutLoaded_) pageOffsets_.clear();
+      if (pageLutLoaded_) {
+        pageLutCount_ = onDisk;
+        if (visibleLutOffset >= HEADER_SIZE && visibleLutOffset + bytes <= fileSize) {
+          visibleOffsets_ = makeUniqueNoThrow<uint32_t[]>(onDisk);
+          if (visibleOffsets_) {
+            f.seek(visibleLutOffset);
+            if (f.read(visibleOffsets_.get(), bytes) != static_cast<int>(bytes)) visibleOffsets_.reset();
+          }
+        }
+      } else {
+        pageOffsets_.reset();
+      }
     }
   }
   return true;
@@ -803,9 +813,9 @@ std::unique_ptr<Page> Section::loadPageAt(const int page) const {
 
   uint32_t pagePos = 0;
   uint32_t visibleTextOffset = 0;
-  if (pageLutLoaded_ && page < static_cast<int>(pageOffsets_.size())) {
+  if (pageLutLoaded_ && page < static_cast<int>(pageLutCount_)) {
     pagePos = pageOffsets_[page];
-    if (page < static_cast<int>(visibleOffsets_.size())) visibleTextOffset = visibleOffsets_[page];
+    if (visibleOffsets_) visibleTextOffset = visibleOffsets_[page];
   } else {
     f.seek(HEADER_SIZE - sizeof(uint32_t) * 5);
     uint32_t lutOffset;

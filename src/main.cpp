@@ -63,6 +63,8 @@ constexpr unsigned long INPUT_LOCK_CLICK_MAX_HOLD_MS = 300;
 // (covers the double-tap window and the badge refresh), in slices this long.
 constexpr unsigned long LOCK_LIGHT_SLEEP_AFTER_MS = 1000;
 constexpr unsigned long LOCK_LIGHT_SLEEP_SLICE_MS = 1000;
+// After an unlock with no page turn, refresh once to take the badge off the panel.
+constexpr unsigned long INPUT_LOCK_CLEAR_DELAY_MS = 1500;
 }  // namespace
 
 // A wake hold must never become an in-app power-button action.  Boot may continue
@@ -241,7 +243,11 @@ void lockBadgeOrigin(int& x, int& y) {
   y = LOCK_BADGE_INSET;
 }
 
+bool lockBadgeOnPanel = false;         // the panel currently shows the badge
+unsigned long lockBadgeClearDueAt = 0;  // deferred unlock refresh (0 = none)
+
 bool lockBadgeOnBuffer() {
+  if (!renderer.hasFrameBuffer()) return false;
   int x, y;
   lockBadgeOrigin(x, y);
   return lockBadgeValid &&
@@ -251,7 +257,7 @@ bool lockBadgeOnBuffer() {
 }
 
 void drawLockBadge() {
-  if (lockBadgeOnBuffer()) return;
+  if (!renderer.hasFrameBuffer() || lockBadgeOnBuffer()) return;
   int x, y;
   lockBadgeOrigin(x, y);
   if (renderer.readFramebufferRegion(x, y, LOCK_BADGE_SIZE, LOCK_BADGE_SIZE, lockBadgeUnder, LOCK_BADGE_BYTES) !=
@@ -281,9 +287,16 @@ void eraseLockBadge() {
 }
 
 // Runs inside every framebuffer send: keep the badge on top of whatever an
-// activity painted while the lock is on.
+// activity painted while the lock is on. Any send while unlocked takes the
+// badge off the panel, so the deferred unlock refresh becomes unnecessary.
 void lockBadgePreDisplay() {
-  if (mappedInputManager.isInputLocked()) drawLockBadge();
+  if (mappedInputManager.isInputLocked()) {
+    drawLockBadge();
+    lockBadgeOnPanel = true;
+  } else {
+    lockBadgeOnPanel = false;
+    lockBadgeClearDueAt = 0;
+  }
 }
 }  // namespace
 
@@ -314,10 +327,14 @@ bool handleInputLockDoubleClick() {
     RenderLock lock;
     if (locked) {
       drawLockBadge();
+      renderer.displayBuffer(HalDisplay::FAST_REFRESH);  // the hook marks the panel as badged
     } else {
+      // Unlock must not cost a waveform: restore the pixels in the framebuffer
+      // only. The next page turn's own refresh takes the badge off the panel;
+      // if no turn comes, loop() refreshes once after a short quiet period.
       eraseLockBadge();
+      lockBadgeClearDueAt = millis() + INPUT_LOCK_CLEAR_DELAY_MS;
     }
-    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
   }
   LOG_INF("LOCK", "Input %s by power-button double-tap", locked ? "locked" : "unlocked");
   return true;
@@ -796,6 +813,15 @@ void loop() {
   // run a configured short-power action.
   if (handleInputLockDoubleClick()) {
     return;
+  }
+
+  // Deferred unlock refresh: the badge is still on the panel and nothing has
+  // redrawn since the unlock, so push the restored framebuffer once.
+  if (lockBadgeClearDueAt != 0 && lockBadgeOnPanel && !mappedInputManager.isInputLocked() &&
+      millis() >= lockBadgeClearDueAt && !RenderLock::peek() && renderer.hasFrameBuffer()) {
+    RenderLock lock;
+    lockBadgeClearDueAt = 0;
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
   }
 
 #if FREEINK_CAP_TOUCH

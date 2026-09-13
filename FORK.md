@@ -28,9 +28,12 @@ Rules that keep rebases painless:
    `lib/GfxRenderer/*`). Two short taps (<300 ms each, within 500 ms) lock every
    button; two more unlock. A 32×32 padlock badge appears top-right, drawn straight
    into the framebuffer with one FAST differential refresh and restored from a
-   saved snapshot on unlock, so no page re-render happens either way. Long-press
-   sleep and the sleep timeout still work while locked; wake always unlocks
-   (deep sleep is a chip reset). Single tap keeps whatever "Short power button
+   saved snapshot on unlock; unlock restores the framebuffer only and the next page
+   turn (or a refresh 1.5 s later) clears the panel, so unlock never waits on a
+   waveform. While locked the device never auto-sleeps; after 1 s of quiet the CPU
+   light-sleeps between power-button polls (page, SD mount and position retained,
+   GPIO-level wake on the button, upstream-measured ~2.8 mA vs ~9.7 mA). Long-press
+   sleep still works; wake from deep sleep always unlocks (chip reset). Single tap keeps whatever "Short power button
    press" is set to (default Ignore). If that setting is *Sleep* the lock is
    unreachable, because each tap sleeps before a second can land.
 

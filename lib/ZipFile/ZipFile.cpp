@@ -141,9 +141,9 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
       case IndexLookup::Found:
         return true;
       case IndexLookup::NotFound:
-        return false;  // the index is valid and complete: no need to scan
       case IndexLookup::Unavailable:
-        break;  // no/stale index: fall through to the scan
+        break;  // no/stale index, or an index that may be incomplete (a short
+                // central-directory walk at build time): fall through to the scan
     }
   }
 

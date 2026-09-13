@@ -382,7 +382,10 @@ void EpubReaderActivity::loop() {
       buildTickHeapGate()) {
     RenderLock lock;
     if (section->isBuilding() && buildTickHeapGate()) {
-      if (!section->buildSomeMore(BACKGROUND_BUILD_PAGES_PER_TICK)) {
+      // Idle-only ticks lay out one page at a time so a press waits at most one page's layout.
+      const bool windowed = section->isPartial() ||
+                            static_cast<int>(section->pageCount) < section->currentPage + BUILD_WINDOW_AHEAD;
+      if (!section->buildSomeMore(windowed ? BACKGROUND_BUILD_PAGES_PER_TICK : 1)) {
         LOG_ERR("ERS", "Background section build failed");
         section.reset();
         requestUpdate();
@@ -1575,10 +1578,23 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const auto tDisplay = millis();
 
   if (tiledGrayscale) {
-    constexpr int STRIP_ROWS = 80;
     const int gh = renderer.getDisplayHeight();
     const int gwBytes = renderer.getDisplayWidthBytes();
     const size_t planeBytes = static_cast<size_t>(gwBytes) * gh;
+    // Each strip re-walks the whole page (every line's shaping and kerning;
+    // only the glyph pixels are clipped), twice per plane. Taller strips mean
+    // fewer walks: 80 rows = 6 strips/plane, 160 = 3, 240 = 2. Pick the
+    // tallest scratch the heap can spare and keep 80 as the floor.
+    constexpr size_t STRIP_SCRATCH_RESERVE = 20 * 1024;
+    int stripRows = 80;
+    for (const int candidate : {240, 160}) {
+      const size_t need = static_cast<size_t>(gwBytes) * candidate;
+      if (ESP.getMaxAllocHeap() >= need + STRIP_SCRATCH_RESERVE && ESP.getFreeHeap() >= need + 2 * STRIP_SCRATCH_RESERVE) {
+        stripRows = candidate;
+        break;
+      }
+    }
+    const int STRIP_ROWS = stripRows;
 
     auto renderPlaneToBuffer = [&](const bool lsbPlane, uint8_t* buf) {
       renderer.setRenderMode(lsbPlane ? GfxRenderer::GRAYSCALE_LSB : GfxRenderer::GRAYSCALE_MSB);
