@@ -5,6 +5,7 @@
 #include <Utf8.h>
 
 #include <cstdlib>
+#include <cstring>
 
 FontDecompressor::~FontDecompressor() { deinit(); }
 
@@ -30,6 +31,24 @@ void FontDecompressor::freePageBuffer() {
     pageSlots[s] = {};
   }
   pageSlotCount = 0;
+}
+
+// Free one slot and close the gap so slots [0, pageSlotCount) stay dense.
+void FontDecompressor::freeSlot(const uint8_t index) {
+  if (index >= pageSlotCount) return;
+  free(pageSlots[index].buffer);
+  free(pageSlots[index].glyphs);
+  for (uint8_t s = index; s + 1 < pageSlotCount; s++) {
+    pageSlots[s] = pageSlots[s + 1];
+  }
+  pageSlots[pageSlotCount - 1] = {};
+  pageSlotCount--;
+}
+
+uint32_t FontDecompressor::retainedBytes() const {
+  uint32_t total = 0;
+  for (uint8_t s = 0; s < pageSlotCount; s++) total += pageSlots[s].bufferBytes;
+  return total;
 }
 
 void FontDecompressor::freeHotGroup() {
@@ -251,13 +270,6 @@ int32_t FontDecompressor::findGlyphIndex(const EpdFontData* fontData, uint32_t c
 int FontDecompressor::prewarmCache(const EpdFontData* fontData, const char* utf8Text) {
   if (!fontData || !fontData->groups || !utf8Text) return 0;
 
-  // Allocate the next available slot (caller must call freePageBuffer/clearCache to reset)
-  if (pageSlotCount >= MAX_PAGE_SLOTS) {
-    LOG_ERR("FDC", "All %u page buffer slots full, cannot prewarm fontData=%p", MAX_PAGE_SLOTS, (void*)fontData);
-    return -1;
-  }
-  PageSlot& slot = pageSlots[pageSlotCount];
-
   // Step 1: Collect unique glyph indices needed for this page
   uint32_t neededGlyphs[MAX_PAGE_GLYPHS];
   uint16_t glyphCount = 0;
@@ -329,7 +341,90 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, const char* utf8
 
   if (glyphCount == 0) return 0;
 
-  // Step 2: Compute total buffer size and collect unique groups
+  // Step 1b: Resolve the slot. A slot that already holds this font is reused and
+  // only the glyphs missing from it are decompressed. neededGlyphs is filtered
+  // down to that missing set here; every step below works on `missing` only.
+  int8_t slotIndex = -1;
+  for (uint8_t s = 0; s < pageSlotCount; s++) {
+    if (pageSlots[s].fontData == fontData) {
+      slotIndex = static_cast<int8_t>(s);
+      break;
+    }
+  }
+
+  uint16_t missingCount = 0;
+  uint32_t missingBytes = 0;
+  if (slotIndex >= 0) {
+    const PageSlot& have = pageSlots[slotIndex];
+    for (uint16_t i = 0; i < glyphCount; i++) {
+      const uint32_t gi = neededGlyphs[i];
+      int left = 0, right = static_cast<int>(have.glyphCount) - 1;
+      bool present = false;
+      while (left <= right) {
+        const int mid = left + (right - left) / 2;
+        if (have.glyphs[mid].glyphIndex == gi) {
+          present = have.glyphs[mid].bufferOffset != UINT32_MAX;
+          break;
+        }
+        if (have.glyphs[mid].glyphIndex < gi)
+          left = mid + 1;
+        else
+          right = mid - 1;
+      }
+      if (!present) {
+        neededGlyphs[missingCount++] = gi;
+        missingBytes += fontData->glyph[gi].dataLength;
+      }
+    }
+    if (missingCount == 0) {
+      pageSlots[slotIndex].lastUsed = generation_;
+      stats.cacheHits += glyphCount;
+      return 0;  // everything this page needs is already resident
+    }
+    // Keep the total budget by evicting the least-recently-used *other* slots
+    // first (a style the page no longer uses), then judge this slot alone.
+    while (retainedBytes() + missingBytes > TOTAL_RETAIN_MAX_BYTES && pageSlotCount > 1) {
+      int8_t victim = -1;
+      for (uint8_t s = 0; s < pageSlotCount; s++) {
+        if (s == slotIndex) continue;
+        if (victim < 0 || pageSlots[s].lastUsed < pageSlots[victim].lastUsed) victim = static_cast<int8_t>(s);
+      }
+      if (victim < 0) break;
+      freeSlot(static_cast<uint8_t>(victim));
+      if (victim < slotIndex) slotIndex--;  // freeSlot closed the gap below us
+    }
+    const PageSlot& cur = pageSlots[slotIndex];
+    if (cur.glyphCount + missingCount > MAX_PAGE_GLYPHS || cur.bufferBytes + missingBytes > SLOT_RETAIN_MAX_BYTES ||
+        retainedBytes() + missingBytes > TOTAL_RETAIN_MAX_BYTES) {
+      // Over budget: rebuild this slot for the current page only.
+      freeSlot(static_cast<uint8_t>(slotIndex));
+      slotIndex = -1;
+    }
+  }
+  if (slotIndex < 0) {
+    missingCount = glyphCount;
+    missingBytes = 0;
+    for (uint16_t i = 0; i < glyphCount; i++) missingBytes += fontData->glyph[neededGlyphs[i]].dataLength;
+    // Make room: evict least-recently-used slots while a fifth font would not
+    // fit or the retained total would exceed the budget.
+    while (pageSlotCount >= MAX_PAGE_SLOTS ||
+           (pageSlotCount > 0 && retainedBytes() + missingBytes > TOTAL_RETAIN_MAX_BYTES)) {
+      uint8_t victim = 0;
+      for (uint8_t s = 1; s < pageSlotCount; s++) {
+        if (pageSlots[s].lastUsed < pageSlots[victim].lastUsed) victim = s;
+      }
+      freeSlot(victim);
+    }
+    slotIndex = static_cast<int8_t>(pageSlotCount);
+    pageSlots[slotIndex] = {};
+    pageSlots[slotIndex].fontData = fontData;
+    pageSlotCount++;
+  }
+  PageSlot& slot = pageSlots[slotIndex];
+  slot.lastUsed = generation_;
+  glyphCount = missingCount;  // from here on, "needed" means "missing from the slot"
+
+  // Step 2: Compute the added buffer size and collect the unique groups to inflate
   uint32_t totalBytes = 0;
   uint16_t neededGroups[128];
   uint8_t groupCount = 0;
@@ -357,27 +452,38 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, const char* utf8
 
   stats.uniqueGroupsAccessed = groupCount;
 
-  // Step 3: Allocate page buffer and lookup table for this slot
-  slot.buffer = static_cast<uint8_t*>(malloc(totalBytes));
-  slot.glyphs = static_cast<PageGlyphEntry*>(malloc(glyphCount * sizeof(PageGlyphEntry)));
-  if (!slot.buffer || !slot.glyphs) {
-    LOG_ERR("FDC", "Failed to allocate page buffer (%u bytes, %u glyphs)", totalBytes, glyphCount);
-    free(slot.buffer);
-    free(slot.glyphs);
-    slot = {};
+  // Step 3: Grow the slot's buffer and lookup table by the missing glyphs. The
+  // resident glyph data is copied verbatim (its offsets stay valid); the new
+  // entries are appended unextracted and the table is re-sorted.
+  const uint32_t oldBytes = slot.bufferBytes;
+  const uint16_t oldCount = slot.glyphCount;
+  auto* newBuffer = static_cast<uint8_t*>(malloc(oldBytes + totalBytes));
+  auto* newGlyphs = static_cast<PageGlyphEntry*>(malloc((oldCount + glyphCount) * sizeof(PageGlyphEntry)));
+  if (!newBuffer || !newGlyphs) {
+    LOG_ERR("FDC", "Failed to allocate page buffer (%u bytes, %u glyphs)", oldBytes + totalBytes,
+            oldCount + glyphCount);
+    free(newBuffer);
+    free(newGlyphs);
+    freeSlot(static_cast<uint8_t>(slotIndex));
     return glyphCount;
   }
+  if (oldCount > 0) {
+    memcpy(newBuffer, slot.buffer, oldBytes);
+    memcpy(newGlyphs, slot.glyphs, oldCount * sizeof(PageGlyphEntry));
+  }
+  free(slot.buffer);
+  free(slot.glyphs);
+  slot.buffer = newBuffer;
+  slot.glyphs = newGlyphs;
   stats.pageBufferBytes += totalBytes;
   stats.pageGlyphsBytes += glyphCount * sizeof(PageGlyphEntry);
 
-  slot.fontData = fontData;
-  slot.glyphCount = glyphCount;
-  pageSlotCount++;
-
-  // Initialize lookup entries (bufferOffset = UINT32_MAX means not yet extracted)
+  // Append lookup entries (bufferOffset = UINT32_MAX means not yet extracted)
   for (uint16_t i = 0; i < glyphCount; i++) {
-    slot.glyphs[i] = {neededGlyphs[i], UINT32_MAX, 0};
+    slot.glyphs[oldCount + i] = {neededGlyphs[i], UINT32_MAX, 0};
   }
+  slot.glyphCount = oldCount + glyphCount;
+  glyphCount = slot.glyphCount;  // the sort and the group scans below cover the whole table
 
   // Sort by glyphIndex for binary search in getBitmap()
   for (uint16_t i = 1; i < glyphCount; i++) {
@@ -461,7 +567,7 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, const char* utf8
   }
 
   // Step 4: For each unique group, decompress to temp buffer and extract needed glyphs
-  uint32_t writeOffset = 0;
+  uint32_t writeOffset = oldBytes;
   int missed = 0;
 
   for (uint8_t g = 0; g < groupCount; g++) {
@@ -498,9 +604,10 @@ int FontDecompressor::prewarmCache(const EpdFontData* fontData, const char* utf8
 
     free(tempBuf);
   }
+  slot.bufferBytes = writeOffset;
 
-  LOG_DBG("FDC", "Prewarm: %u glyphs in %u bytes from %u groups (%d missed)", glyphCount, writeOffset, groupCount,
-          missed);
+  LOG_DBG("FDC", "Prewarm: +%u glyphs (%u resident) in %u bytes from %u groups (%d missed)", missingCount, oldCount,
+          writeOffset, groupCount, missed);
 
   return missed;
 }

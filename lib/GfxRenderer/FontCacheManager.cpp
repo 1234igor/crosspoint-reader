@@ -160,7 +160,11 @@ void FontCacheManager::recordText(const char* text, int fontId, EpdFontFamily::S
 
 FontCacheManager::PrewarmScope::PrewarmScope(FontCacheManager& manager) : manager_(&manager) {
   manager_->scanMode_ = ScanMode::Scanning;
-  manager_->clearCache();
+  // Built-in font glyphs are retained across scopes (FontDecompressor keeps
+  // its page slots and only inflates what the next page is missing); the SD
+  // font per-page caches are reset as before.
+  if (manager_->fontDecompressor_) manager_->fontDecompressor_->beginPage();
+  for (auto& [id, font] : manager_->sdCardFonts_) font->clearCache();
   manager_->resetStats();
   manager_->scanCodepointCount_ = 0;
   manager_->scanFontCount_ = 0;
@@ -208,7 +212,8 @@ void FontCacheManager::PrewarmScope::endScanAndPrewarm() {
 FontCacheManager::PrewarmScope::~PrewarmScope() {
   if (active_) {
     endScanAndPrewarm();  // no-op if already called
-    manager_->clearCache();
+    if (manager_->fontDecompressor_) manager_->fontDecompressor_->endPage();
+    for (auto& [id, font] : manager_->sdCardFonts_) font->clearCache();
   }
 }
 

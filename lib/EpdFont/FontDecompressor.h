@@ -22,6 +22,16 @@ class FontDecompressor {
   // Free all cached data (page buffer + hot group).
   void clearCache();
 
+  // Page-boundary hooks for the retained glyph cache. Page slots survive
+  // across pages: prewarmCache() only decompresses the glyphs a page needs
+  // that are not already resident, so consecutive body-text pages cost no
+  // group inflation at all. beginPage() advances the LRU generation used to
+  // evict slots when a fifth font style shows up; endPage() drops only the
+  // hot-group fallback buffer. clearCache() still frees everything for
+  // heap-critical callers.
+  void beginPage() { generation_++; }
+  void endPage() { freeHotGroup(); }
+
   // Pre-scan UTF-8 text and extract needed glyph bitmaps into a flat page buffer.
   // Each group is decompressed once into a temp buffer; only needed glyphs are kept.
   // Returns the number of glyphs that couldn't be loaded (0 on full success).
@@ -59,9 +69,21 @@ class FontDecompressor {
     const EpdFontData* fontData = nullptr;
     PageGlyphEntry* glyphs = nullptr;
     uint16_t glyphCount = 0;
+    uint32_t bufferBytes = 0;  // bytes of `buffer` in use (compacted glyph data)
+    uint32_t lastUsed = 0;     // generation_ of the last page that needed this slot
   };
   PageSlot pageSlots[MAX_PAGE_SLOTS] = {};
   uint8_t pageSlotCount = 0;
+  uint32_t generation_ = 0;
+  // Retention budget. A body-text page is ~70 glyphs / ~2.5 KB in one style, so
+  // 6 KB per slot and 8 KB in total hold the working set of several pages
+  // without eating into the ~112 KB the reader wants free for its two tiled
+  // grayscale plane buffers. Past the budget the slot is rebuilt from scratch
+  // for the current page, exactly as before.
+  static constexpr uint32_t SLOT_RETAIN_MAX_BYTES = 6 * 1024;
+  static constexpr uint32_t TOTAL_RETAIN_MAX_BYTES = 8 * 1024;
+  void freeSlot(uint8_t index);
+  uint32_t retainedBytes() const;
 
   // Hot group: last decompressed group (byte-aligned) for non-prewarmed fallback path.
   // Kept in byte-aligned format; individual glyphs are compacted on demand into hotGlyphBuf.
