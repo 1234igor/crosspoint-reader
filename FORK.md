@@ -34,6 +34,16 @@ Rules that keep rebases painless:
    press" is set to (default Ignore). If that setting is *Sleep* the lock is
    unreachable, because each tap sleeps before a second can land.
 
+2. **Reading-speed batch** (8 commits, see `../xteink/docs/reading-speed-audit-2026-09-13.md`
+   for the audit and status table). Progress writes debounced off the page turn;
+   status-bar title cached; built-in glyphs retained across pages; `HalFile`
+   read-ahead + one persistent section-file handle with cached page LUTs; image
+   dimensions memoized per book (`imgdims.bin`); chapter layout finishes while idle;
+   persistent ZIP central-directory index (`zip.idx`) + read-ahead on scans; row-walking
+   glyph blit (`lib/GfxRenderer/GlyphBlit.h`, host-verified by
+   `test/glyph_blit/glyph_blit_selftest.cpp`). Plus two upstream cherry-picks
+   (#3463 input wake, #3527 font cache release).
+
 ## Taking a new upstream release
 
 ```bash
@@ -43,6 +53,10 @@ git rebase 1.7.0            # the new tag
 git submodule update --init --recursive
 pio run -e igor
 ```
+
+Expected conflicts at the next rebase: upstream #3521 (font-cache heap fragmentation,
+`lib/EpdFont/SdCardFont.*`, `lib/GfxRenderer/FontCacheManager.cpp`) overlaps the
+retained glyph cache commit; keep ours for `PrewarmScope`, take theirs elsewhere.
 
 Fix conflicts if any (they'll be in the files listed under Patches), then build,
 flash, and push: `git push -f origin igor` (the branch is rebased, so force is expected).
