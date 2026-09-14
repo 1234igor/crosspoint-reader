@@ -115,11 +115,6 @@ class HalGPIO {
   // Returns true if verification succeeded, false if device should return to sleep.
   // Should only be called when wakeup reason is PowerButton.
   bool verifyPowerButtonWakeup();
-  // Deep-lock wake gesture: the press that woke the chip is tap 1. Wait for it
-  // to release within releaseTimeoutMs (a longer press is a hold, not a tap),
-  // then for a second press within tapWindowMs, debounced 20 ms. Raw pin reads,
-  // no InputManager state: this runs before the SD card or display exist.
-  bool waitForPowerDoubleTap(unsigned long releaseTimeoutMs, unsigned long tapWindowMs);
 
   // Check if USB is connected
   bool isUsbConnected() const;

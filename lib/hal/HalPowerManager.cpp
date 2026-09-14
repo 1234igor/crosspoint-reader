@@ -109,7 +109,11 @@ bool HalPowerManager::lightSleep(const HalGPIO& gpio, const unsigned long sliceM
   }
 
   if (err != ESP_OK) {
-    LOG_DBG("PWR", "Light sleep rejected: %d", static_cast<int>(err));
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      LOG_INF("PWR", "Light sleep rejected: %d (the lock will idle awake until deep lock)", static_cast<int>(err));
+    }
     return false;
   }
   return true;

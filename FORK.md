@@ -34,10 +34,15 @@ Rules that keep rebases painless:
    light-sleeps between power-button polls (page, SD mount and position retained,
    GPIO-level wake on the button, upstream-measured ~2.8 mA vs ~9.7 mA). Long-press
    sleep still works. After 30 s locked the device **deep-sleeps with the page +
-   badge on the panel** (`enterDeepLockSleep`, RTC flag `deepLockMagic`); the wake
-   requires a second tap (`HalGPIO::waitForPowerDoubleTap`, checked in `setup()`
-   before the SD card is touched), restores the saved frame minus the badge with one
-   FAST refresh, and reloads the reader behind it. Wake from any other deep sleep
+   badge on the panel** (`enterDeepLockSleep`, RTC flags `deepLockMagic`/`deepLockPin`);
+   the wake requires a second tap, verified by `deepLockWakeGate()` as the FIRST line
+   of `setup()` on raw GPIO (the normal init reaches the button ~250 ms after the
+   wake edge, too late for a natural double tap). A miss re-sleeps via
+   `freeink::PowerManager::deepSleepUntilPowerButton()` with nothing initialized.
+   A hit restores the saved frame minus the badge with one FAST refresh and reloads
+   the reader behind it. Two reviewer passes (2026-09-14) signed off on this shape;
+   the alternative they offered is a 300 ms hold instead of tap-tap if the double
+   tap ever proves unreliable. Wake from any other deep sleep
    always unlocks (chip reset). Single tap keeps whatever "Short power button
    press" is set to (default Ignore). If that setting is *Sleep* the lock is
    unreachable, because each tap sleeps before a second can land.

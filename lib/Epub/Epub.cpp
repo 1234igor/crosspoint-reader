@@ -423,6 +423,10 @@ bool Epub::load(const bool buildIfMissing, const bool skipLoadingCss) {
 
   // Try to load existing cache first
   if (bookMetadataCache->load()) {
+    // Books cached before the zip index existed: build it once now.
+    if (!Storage.exists(zipIndexPath().c_str())) {
+      ZipFile(filepath, zipIndexPath()).buildIndex();
+    }
     if (!skipLoadingCss) {
       const CssParser::CacheStatus cacheStatus = cssParser->inspectCache();
       CssParser::CacheLoadResult cacheLoadResult = CssParser::CacheLoadResult::Invalid;

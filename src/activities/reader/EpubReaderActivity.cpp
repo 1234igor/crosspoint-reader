@@ -160,6 +160,9 @@ EpubReaderActivity::~EpubReaderActivity() {
   }
 
   section.reset();
+  // Retained glyph slots (up to 16 KB) are only useful while reading; give the
+  // heap back to Home, cover thumbnails and the other activities.
+  if (auto* fcm = renderer.getFontCacheManager()) fcm->releaseSdFontCaches();
   if (pendingReadFolderMove && epub) {
     const std::string srcPath = epub->getPath();
     const std::string oldCachePath = epub->getCachePath();

@@ -12,6 +12,9 @@
 #include <HalStorage.h>
 #include <HalSystem.h>
 #include <HalTiltSensor.h>
+#include <PowerManager.h>
+#include <esp_sleep.h>
+#include <esp_system.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <SPI.h>
@@ -71,7 +74,8 @@ constexpr unsigned long INPUT_LOCK_CLEAR_DELAY_MS = 1500;
 // the chip, setup() waits for the second before touching the SD card.
 constexpr unsigned long DEEP_LOCK_AFTER_MS = 30000;
 constexpr unsigned long DEEP_LOCK_TAP_RELEASE_MS = 400;  // tap 1 must release within this after boot
-constexpr unsigned long DEEP_LOCK_TAP_WINDOW_MS = 600;   // tap 2 must land within this after tap 1 releases
+constexpr unsigned long DEEP_LOCK_TAP_WINDOW_MS = 800;   // tap 2 must land within this after tap 1 releases
+constexpr unsigned long DEEP_LOCK_RELEASE_STABLE_MS = 15;  // release must hold this long (contact bounce)
 constexpr char LOCK_UNDER_FILE[] = "/.crosspoint/lock_under.bin";
 }  // namespace
 
@@ -150,7 +154,10 @@ RTC_NOINIT_ATTR uint32_t silentRebootTarget;
 // Set right before the input lock's deep sleep; survives the sleep (RTC RAM)
 // but not a power loss. A wake with it set expects a double tap, not a hold.
 RTC_NOINIT_ATTR uint32_t deepLockMagic;
+RTC_NOINIT_ATTR int32_t deepLockPin;             // power button GPIO, so the gate needs no BoardConfig
+RTC_NOINIT_ATTR uint32_t deepLockPinActiveHigh;  // its pressed level
 static constexpr uint32_t DEEP_LOCK_MAGIC = 0x4C4F434B;  // "LOCK"
+static bool deepLockWakeVerified = false;  // set by deepLockWakeGate() for the rest of setup()
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
@@ -428,6 +435,7 @@ void enterDeepSleep(bool fromTimeout = false) {
     // A stale Quick Resume frame must not replace the selected sleep screen during wake.
     Storage.remove(SLEEP_FRAME_FILE);
   }
+  if (Storage.exists(LOCK_UNDER_FILE)) Storage.remove(LOCK_UNDER_FILE);
 
   // Tear down WiFi so the modem power domain isn't held alive across deep sleep.
   // Wake from deep sleep is effectively a chip reset, so no state needs to survive.
@@ -448,8 +456,6 @@ void enterDeepSleep(bool fromTimeout = false) {
 // already shows the page + badge), saves that frame plus the 128 bytes under
 // the badge, flags the wake as a lock wake, and deep-sleeps. The badge/frame
 // helpers are defined further down; forward-declared here.
-void drawLockBadge();
-uint8_t* lockBadgeUnderBytes();
 static void enterDeepLockSleep() {
   HalPowerManager::Lock powerLock;
   APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
@@ -457,10 +463,11 @@ static void enterDeepLockSleep() {
   APP_STATE.saveToFile();
 
   deepSleepInProgress = true;
-  activityManager.replaceActivity(
-      std::make_unique<SleepActivity>(renderer, mappedInputManager, /*fromTimeout=*/false, /*silent=*/true));
-  activityManager.loop();  // applies the swap: the reader flushes progress and suspends its build
 
+  // Save the frame BEFORE the activity swap: ReaderActivity::onExit() resets
+  // the orientation to Portrait, which would move the badge rect and make
+  // drawLockBadge() stamp a second badge. The silent SleepActivity paints
+  // nothing, so saving first is safe.
   {
     RenderLock lock;
     drawLockBadge();  // idempotent: makes sure the buffer matches the panel (page + badge)
@@ -471,10 +478,14 @@ static void enterDeepLockSleep() {
     if (Storage.openFileForWrite("SLP", LOCK_UNDER_FILE, under)) {
       const uint8_t orientation = static_cast<uint8_t>(renderer.getOrientation());
       under.write(&orientation, 1);
-      under.write(lockBadgeUnderBytes(), 32 * 32 / 8);
+      under.write(lockBadgeUnderBytes(), LOCK_BADGE_BYTES);
       under.close();
     }
   }
+
+  activityManager.replaceActivity(
+      std::make_unique<SleepActivity>(renderer, mappedInputManager, /*fromTimeout=*/false, /*silent=*/true));
+  activityManager.loop();  // applies the swap: the reader flushes progress and suspends its build
 
   if (WiFi.getMode() != WIFI_MODE_NULL) {
     WiFi.disconnect(true);
@@ -483,9 +494,68 @@ static void enterDeepLockSleep() {
   halTiltSensor.deepSleep();
   display.deepSleep();
   Storage.prepareForDeepSleep();
+  deepLockPin = BoardConfig::ACTIVE.input.power;
+  deepLockPinActiveHigh = BoardConfig::ACTIVE.input.powerActiveHigh ? 1 : 0;
   deepLockMagic = DEEP_LOCK_MAGIC;
   LOG_INF("LOCK", "Deep lock: entering deep sleep");
   powerManager.startDeepSleep(gpio);
+}
+
+// Deep-lock wake gate. Runs as the FIRST thing in setup(), before any rail,
+// bus, NVS or display probe is touched: by the time the normal init reaches
+// the power button (~250 ms after the wake edge) a natural double tap is
+// already over. Here the window opens ~60-100 ms after the edge, on raw GPIO.
+// The press that woke the chip is tap 1; it must release within
+// DEEP_LOCK_TAP_RELEASE_MS (a longer press is a hold, not a tap), stay
+// released for DEEP_LOCK_RELEASE_STABLE_MS (contact bounce), and a second
+// press must land within DEEP_LOCK_TAP_WINDOW_MS. Anything else goes straight
+// back to deep sleep, still locked, with the panel still in DSLP, the SD rail
+// still off (the previous sleep's pad holds are untouched) and ~100 ms spent.
+static void deepLockWakeGate() {
+  if (deepLockMagic != DEEP_LOCK_MAGIC) return;
+  deepLockMagic = 0;  // one-shot: any other boot (brownout, panic, USB) comes up unlocked
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP || esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_GPIO) return;
+  const int32_t pin = deepLockPin;
+  if (pin < 0 || pin > 21) return;
+  const bool activeHigh = deepLockPinActiveHigh != 0;
+  pinMode(pin, activeHigh ? INPUT_PULLDOWN : INPUT_PULLUP);
+  const int pressedLevel = activeHigh ? HIGH : LOW;
+  const auto pressed = [&] { return digitalRead(pin) == pressedLevel; };
+
+  bool unlocked = false;
+  unsigned long t = millis();
+  while (pressed()) {  // tap 1 still down
+    if (millis() - t > DEEP_LOCK_TAP_RELEASE_MS) goto decided;
+    delay(2);
+  }
+  {
+    // Debounced release: restart the stability clock on any bounce, bounded overall.
+    const unsigned long stableStart = millis();
+    unsigned long quietSince = millis();
+    while (millis() - quietSince < DEEP_LOCK_RELEASE_STABLE_MS) {
+      if (pressed()) quietSince = millis();
+      if (millis() - stableStart > DEEP_LOCK_TAP_RELEASE_MS) goto decided;
+      delay(2);
+    }
+  }
+  t = millis();
+  while (millis() - t <= DEEP_LOCK_TAP_WINDOW_MS) {  // tap 2
+    if (pressed()) {
+      delay(20);
+      if (pressed()) {
+        unlocked = true;
+        break;
+      }
+    }
+    delay(2);
+  }
+decided:
+  if (unlocked) {
+    deepLockWakeVerified = true;
+    return;
+  }
+  deepLockMagic = DEEP_LOCK_MAGIC;
+  freeink::PowerManager::deepSleepUntilPowerButton();  // waits for release, re-arms the same wake, never returns
 }
 
 void setupDisplayAndFonts(bool seamless = false) {
@@ -535,6 +605,7 @@ void setupDisplayAndFonts(bool seamless = false) {
 }
 
 void setup() {
+  deepLockWakeGate();  // must stay first: see its comment
   BoardConfig::holdPowerRails();
 
 #ifdef ENABLE_SERIAL_LOG
@@ -572,15 +643,8 @@ void setup() {
   // only SD state survives to the next boot.
   const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || gpio.verifyPowerButtonWakeup();
 
-  // Deep-lock wake: the press that woke us is tap 1 of the unlock gesture. Decide
-  // before the SD card or display are touched so a stray single press (bag,
-  // pocket) costs ~100 ms awake and goes straight back to sleep, still locked.
-  const bool deepLockWake = wakeupReason == HalGPIO::WakeupReason::PowerButton && deepLockMagic == DEEP_LOCK_MAGIC;
-  deepLockMagic = 0;
-  if (deepLockWake && !gpio.waitForPowerDoubleTap(DEEP_LOCK_TAP_RELEASE_MS, DEEP_LOCK_TAP_WINDOW_MS)) {
-    deepLockMagic = DEEP_LOCK_MAGIC;
-    powerManager.startDeepSleep(gpio);
-  }
+  // Deep-lock wake: deepLockWakeGate() already verified the double tap.
+  const bool deepLockWake = deepLockWakeVerified && wakeupReason == HalGPIO::WakeupReason::PowerButton;
 
   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
   // gate recovery on the non-strap Down key (GPIO7) to avoid a stuck-in-recovery loop.
@@ -716,11 +780,13 @@ void setup() {
           HalFile under;
           if (Storage.openFileForRead("SLP", LOCK_UNDER_FILE, under)) {
             uint8_t orientation = 0;
-            uint8_t bytes[32 * 32 / 8];
+            uint8_t bytes[LOCK_BADGE_BYTES];
             if (under.read(&orientation, 1) == 1 && orientation <= GfxRenderer::LandscapeCounterClockwise &&
                 under.read(bytes, sizeof(bytes)) == static_cast<int>(sizeof(bytes))) {
               renderer.setOrientation(static_cast<GfxRenderer::Orientation>(orientation));
-              renderer.writeFramebufferRegion(renderer.getScreenWidth() - 8 - 32, 8, 32, 32, bytes);
+              int bx, by;
+              lockBadgeOrigin(bx, by);
+              renderer.writeFramebufferRegion(bx, by, LOCK_BADGE_SIZE, LOCK_BADGE_SIZE, bytes);
               renderer.setOrientation(GfxRenderer::Orientation::Portrait);
             }
             under.close();

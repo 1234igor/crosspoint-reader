@@ -383,6 +383,7 @@ ZipFile::IndexLookup ZipFile::lookupIndex(const char* filename, FileStatSlim* fi
   }
 
   const size_t nameLen = strlen(filename);
+  if (nameLen >= 256) return IndexLookup::NotFound;  // buildIndex never indexes such names
   const uint64_t hash = fnvHash64(filename, nameLen);
   const auto readRec = [&](const int i, IndexRec& r) {
     return idx.seek(sizeof(IndexHeader) + sizeof(IndexRec) * static_cast<size_t>(i)) &&
