@@ -33,7 +33,12 @@ Rules that keep rebases painless:
    waveform. While locked the device never auto-sleeps; after 1 s of quiet the CPU
    light-sleeps between power-button polls (page, SD mount and position retained,
    GPIO-level wake on the button, upstream-measured ~2.8 mA vs ~9.7 mA). Long-press
-   sleep still works; wake from deep sleep always unlocks (chip reset). Single tap keeps whatever "Short power button
+   sleep still works. After 30 s locked the device **deep-sleeps with the page +
+   badge on the panel** (`enterDeepLockSleep`, RTC flag `deepLockMagic`); the wake
+   requires a second tap (`HalGPIO::waitForPowerDoubleTap`, checked in `setup()`
+   before the SD card is touched), restores the saved frame minus the badge with one
+   FAST refresh, and reloads the reader behind it. Wake from any other deep sleep
+   always unlocks (chip reset). Single tap keeps whatever "Short power button
    press" is set to (default Ignore). If that setting is *Sleep* the lock is
    unreachable, because each tap sleeps before a second can land.
 
