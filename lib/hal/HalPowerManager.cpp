@@ -119,6 +119,37 @@ bool HalPowerManager::lightSleep(const HalGPIO& gpio, const unsigned long sliceM
   return true;
 }
 
+void HalPowerManager::startRetainedDeepSleep(HalGPIO& gpio) const {
+#if !SOC_PM_SUPPORT_EXT1_WAKEUP
+  if (gpio.isXteinkDevice()) {
+#ifdef ENABLE_SERIAL_LOG
+    logSerial.end();
+#endif
+    // Battery latch stays asserted through the sleep (held pads survive
+    // esp_sleep_config_gpio_isolate; the SDK's deepSleep() arms the hold).
+    gpio_hold_dis(XTEINK_C3_GPIO13);
+    gpio_set_direction(XTEINK_C3_GPIO13, GPIO_MODE_OUTPUT);
+    gpio_set_level(XTEINK_C3_GPIO13, 1);
+    gpio_hold_en(XTEINK_C3_GPIO13);
+    // Panel rail stays powered too: keep its RESET defined HIGH so the
+    // controller cannot drift out of DSLP (same rule powerDownRailsForSleep
+    // applies to boards with a powered panel rail).
+    const int8_t rst = BoardConfig::ACTIVE.display.rst;
+    if (rst >= 0) {
+      const auto g = static_cast<gpio_num_t>(rst);
+      gpio_hold_dis(g);
+      pinMode(rst, OUTPUT);
+      digitalWrite(rst, HIGH);
+      gpio_hold_en(g);
+    }
+    freeink::PowerManager::deepSleepUntilPowerButton();
+  }
+#endif
+  startDeepSleep(gpio);
+  while (true) {
+  }
+}
+
 void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
 #ifdef ENABLE_SERIAL_LOG
   // Tear down HWCDC so the host sees a clean disconnect and the peripheral

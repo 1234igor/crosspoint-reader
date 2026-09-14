@@ -51,6 +51,15 @@ class HalPowerManager {
   // which measured idle at 2.8 mA vs 9.7 mA on an X3. Used by the input lock.
   bool lightSleep(const HalGPIO& gpio, unsigned long sliceMs) const;
 
+  // Deep sleep that keeps the board powered. startDeepSleep() drives GPIO13
+  // low on the C3 Xteink boards, which is the battery power-off: the next
+  // press is a cold boot (POWERON, RTC RAM lost, full image validation,
+  // ~1 s before setup()). The input lock needs a real deep-sleep wake
+  // (~100 ms, RTC retained) so its double tap can be judged in time, so it
+  // holds GPIO13 HIGH and the panel reset defined, arms the power button and
+  // sleeps the chip only. Non-Xteink boards fall back to startDeepSleep().
+  [[noreturn]] void startRetainedDeepSleep(HalGPIO& gpio) const;
+
   // Get battery percentage (range 0-100)
   uint16_t getBatteryPercentage() const;
 

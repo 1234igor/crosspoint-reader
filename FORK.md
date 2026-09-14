@@ -35,10 +35,19 @@ Rules that keep rebases painless:
    GPIO-level wake on the button, upstream-measured ~2.8 mA vs ~9.7 mA). Long-press
    sleep still works. After 30 s locked the device **deep-sleeps with the page +
    badge on the panel** (`enterDeepLockSleep`, RTC flags `deepLockMagic`/`deepLockPin`);
-   the wake requires a second tap, verified by `deepLockWakeGate()` as the FIRST line
-   of `setup()` on raw GPIO (the normal init reaches the button ~250 ms after the
-   wake edge, too late for a natural double tap). A miss re-sleeps via
-   `freeink::PowerManager::deepSleepUntilPowerButton()` with nothing initialized.
+   the wake requires a second tap (or a 400 ms hold), verified by `deepLockWakeGate()`
+   as the FIRST line of `setup()` on raw GPIO (the normal init reaches the button
+   ~250 ms after the wake edge, too late for a natural double tap). A lone tap
+   re-sleeps via `freeink::PowerManager::deepSleepUntilPowerButton()` with nothing
+   initialized. **Hardware fact learned the hard way (lock.log, 2026-09-14):** the
+   stock sleep path drives GPIO13 LOW, which on the X3 is the battery power-off, so a
+   "deep-sleep wake" is really a cold boot (reset=POWERON, RTC RAM lost, full image
+   validation, ~1 s before setup()) — no double tap can survive that. The deep lock
+   therefore uses `HalPowerManager::startRetainedDeepSleep()`: GPIO13 held HIGH, panel
+   RESET held, chip in real deep sleep with the button armed; wake is ~100 ms with RTC
+   intact. Cost: the SD card and rails stay powered (expect well under 1 mA, vs the
+   12.8 µA of a true power-off); `/.crosspoint/lock.log` records battery % at lock and
+   at every boot so the real drain can be read off the card.
    A hit restores the saved frame minus the badge with one FAST refresh and reloads
    the reader behind it. Two reviewer passes (2026-09-14) signed off on this shape;
    the alternative they offered is a 300 ms hold instead of tap-tap if the double

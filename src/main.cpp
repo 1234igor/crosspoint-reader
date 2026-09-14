@@ -503,9 +503,10 @@ static void enterDeepLockSleep() {
   deepLockPin = BoardConfig::ACTIVE.input.power;
   deepLockPinActiveHigh = BoardConfig::ACTIVE.input.powerActiveHigh ? 1 : 0;
   deepLockMagic = DEEP_LOCK_MAGIC;
-  LOG_INF("LOCK", "Deep lock: entering deep sleep");
-  lockTrace("deep-lock sleep: pin=%d", static_cast<int>(deepLockPin));
-  powerManager.startDeepSleep(gpio);
+  LOG_INF("LOCK", "Deep lock: entering retained deep sleep");
+  lockTrace("deep-lock sleep (retained): pin=%d battery=%u%%", static_cast<int>(deepLockPin),
+            powerManager.getBatteryPercentage());
+  powerManager.startRetainedDeepSleep(gpio);
 }
 
 // Deep-lock wake gate. Runs as the FIRST thing in setup(), before any rail,
@@ -739,10 +740,10 @@ void setup() {
   // locked page. The RTC flag is deliberately not required here.
   const bool deepLockWake = deepLockWakeVerified && wakeupReason == HalGPIO::WakeupReason::PowerButton &&
                             Storage.exists(LOCK_UNDER_FILE);
-  lockTrace("boot reset=%d wake=%d reason=%d gate=0x%x rel=%u tap2=%u verified=%d deepLockWake=%d",
+  lockTrace("boot reset=%d wake=%d reason=%d gate=0x%x rel=%u tap2=%u verified=%d deepLockWake=%d battery=%u%%",
             static_cast<int>(esp_reset_reason()), static_cast<int>(esp_sleep_get_wakeup_cause()),
             static_cast<int>(wakeupReason), gateFlags, gateReleaseMs, gateTap2Ms, deepLockWakeVerified ? 1 : 0,
-            deepLockWake ? 1 : 0);
+            deepLockWake ? 1 : 0, powerManager.getBatteryPercentage());
 
   APP_STATE.loadFromFile();
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
