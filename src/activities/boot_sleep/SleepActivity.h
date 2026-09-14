@@ -8,8 +8,12 @@ class HalFile;
 
 class SleepActivity final : public Activity {
  public:
-  explicit SleepActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool fromTimeout = false)
-      : Activity("Sleep", renderer, mappedInput), fromTimeout(fromTimeout) {}
+  // silent: paint nothing. Used by the input lock's deep sleep, where the panel
+  // already shows exactly what it should (the page plus the lock badge) and the
+  // activity swap only exists to tear the reader down cleanly.
+  explicit SleepActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool fromTimeout = false,
+                         bool silent = false)
+      : Activity("Sleep", renderer, mappedInput), fromTimeout(fromTimeout), silent(silent) {}
   void onEnter() override;
 
  private:
@@ -25,4 +29,5 @@ class SleepActivity final : public Activity {
   void renderBlankSleepScreen() const;
 
   bool fromTimeout = false;
+  bool silent = false;
 };

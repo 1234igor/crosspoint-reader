@@ -248,6 +248,24 @@ bool HalGPIO::verifyPowerButtonWakeup() {
   return heldAtFirstSample && inputMgr.isPowerButtonPhysicallyPressed();
 }
 
+bool HalGPIO::waitForPowerDoubleTap(const unsigned long releaseTimeoutMs, const unsigned long tapWindowMs) {
+  if (BoardConfig::ACTIVE.input.power < 0) return true;
+  unsigned long start = millis();
+  while (inputMgr.isPowerButtonPhysicallyPressed()) {
+    if (millis() - start > releaseTimeoutMs) return false;  // held, not tapped
+    delay(2);
+  }
+  start = millis();
+  while (millis() - start <= tapWindowMs) {
+    if (inputMgr.isPowerButtonPhysicallyPressed()) {
+      delay(20);  // debounce: still pressed after 20 ms counts as a real tap
+      if (inputMgr.isPowerButtonPhysicallyPressed()) return true;
+    }
+    delay(2);
+  }
+  return false;
+}
+
 bool HalGPIO::isUsbConnected() const {
   if (deviceIsX3()) {
     // X3: infer USB/charging via BQ27220 Current() register (0x0C, signed mA).

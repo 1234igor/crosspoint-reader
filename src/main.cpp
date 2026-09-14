@@ -33,6 +33,7 @@
 #include "SdCardFontSystem.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
+#include "activities/boot_sleep/SleepActivity.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -65,6 +66,13 @@ constexpr unsigned long LOCK_LIGHT_SLEEP_AFTER_MS = 1000;
 constexpr unsigned long LOCK_LIGHT_SLEEP_SLICE_MS = 1000;
 // After an unlock with no page turn, refresh once to take the badge off the panel.
 constexpr unsigned long INPUT_LOCK_CLEAR_DELAY_MS = 1500;
+// Deep lock: after this much quiet while locked, deep-sleep (12.8 uA) with the
+// page + badge left on the panel. Unlock is then tap, tap: the first tap wakes
+// the chip, setup() waits for the second before touching the SD card.
+constexpr unsigned long DEEP_LOCK_AFTER_MS = 30000;
+constexpr unsigned long DEEP_LOCK_TAP_RELEASE_MS = 400;  // tap 1 must release within this after boot
+constexpr unsigned long DEEP_LOCK_TAP_WINDOW_MS = 600;   // tap 2 must land within this after tap 1 releases
+constexpr char LOCK_UNDER_FILE[] = "/.crosspoint/lock_under.bin";
 }  // namespace
 
 // A wake hold must never become an in-app power-button action.  Boot may continue
@@ -139,6 +147,10 @@ EpdFontFamily ui12FontFamily(&ui12RegularFont, &ui12BoldFont);
 // Definitions for SilentRestart.h. RTC_NOINIT survives ESP.restart() but not power loss.
 RTC_NOINIT_ATTR uint32_t silentRebootMagic;
 RTC_NOINIT_ATTR uint32_t silentRebootTarget;
+// Set right before the input lock's deep sleep; survives the sleep (RTC RAM)
+// but not a power loss. A wake with it set expects a double tap, not a hold.
+RTC_NOINIT_ATTR uint32_t deepLockMagic;
+static constexpr uint32_t DEEP_LOCK_MAGIC = 0x4C4F434B;  // "LOCK"
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
@@ -233,7 +245,7 @@ namespace {
 constexpr int LOCK_BADGE_SIZE = 32;
 constexpr int LOCK_BADGE_INSET = 8;
 constexpr size_t LOCK_BADGE_BYTES = LOCK_BADGE_SIZE * LOCK_BADGE_SIZE / 8;
-uint8_t lockBadgeUnder[LOCK_BADGE_BYTES];  // pixels the badge covers
+uint8_t lockBadgeUnder[LOCK_BADGE_BYTES];  // pixels the badge covers (128 B, see LOCK_UNDER_FILE)
 uint8_t lockBadgeStamp[LOCK_BADGE_BYTES];  // the badge as it reads back
 uint8_t lockBadgeProbe[LOCK_BADGE_BYTES];
 bool lockBadgeValid = false;
@@ -256,6 +268,8 @@ bool lockBadgeOnBuffer() {
          memcmp(lockBadgeProbe, lockBadgeStamp, LOCK_BADGE_BYTES) == 0;
 }
 
+}  // namespace
+uint8_t* lockBadgeUnderBytes() { return lockBadgeUnder; }
 void drawLockBadge() {
   if (!renderer.hasFrameBuffer() || lockBadgeOnBuffer()) return;
   int x, y;
@@ -274,7 +288,7 @@ void drawLockBadge() {
   lockBadgeValid = renderer.readFramebufferRegion(x, y, LOCK_BADGE_SIZE, LOCK_BADGE_SIZE, lockBadgeStamp,
                                                   LOCK_BADGE_BYTES) == LOCK_BADGE_BYTES;
 }
-
+namespace {
 void eraseLockBadge() {
   if (!lockBadgeOnBuffer()) {
     lockBadgeValid = false;
@@ -430,6 +444,50 @@ void enterDeepSleep(bool fromTimeout = false) {
   powerManager.startDeepSleep(gpio);
 }
 
+// Input lock, deep phase. Tears the activity down without painting (the panel
+// already shows the page + badge), saves that frame plus the 128 bytes under
+// the badge, flags the wake as a lock wake, and deep-sleeps. The badge/frame
+// helpers are defined further down; forward-declared here.
+void drawLockBadge();
+uint8_t* lockBadgeUnderBytes();
+static void enterDeepLockSleep() {
+  HalPowerManager::Lock powerLock;
+  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  APP_STATE.showBootScreen = false;  // wake must be splashless: the page is still on the panel
+  APP_STATE.saveToFile();
+
+  deepSleepInProgress = true;
+  activityManager.replaceActivity(
+      std::make_unique<SleepActivity>(renderer, mappedInputManager, /*fromTimeout=*/false, /*silent=*/true));
+  activityManager.loop();  // applies the swap: the reader flushes progress and suspends its build
+
+  {
+    RenderLock lock;
+    drawLockBadge();  // idempotent: makes sure the buffer matches the panel (page + badge)
+    saveSleepFrameBuffer();
+    // The badge rect is logical; the reader may be in landscape while boot
+    // starts in portrait, so the orientation rides along with the pixels.
+    HalFile under;
+    if (Storage.openFileForWrite("SLP", LOCK_UNDER_FILE, under)) {
+      const uint8_t orientation = static_cast<uint8_t>(renderer.getOrientation());
+      under.write(&orientation, 1);
+      under.write(lockBadgeUnderBytes(), 32 * 32 / 8);
+      under.close();
+    }
+  }
+
+  if (WiFi.getMode() != WIFI_MODE_NULL) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
+  halTiltSensor.deepSleep();
+  display.deepSleep();
+  Storage.prepareForDeepSleep();
+  deepLockMagic = DEEP_LOCK_MAGIC;
+  LOG_INF("LOCK", "Deep lock: entering deep sleep");
+  powerManager.startDeepSleep(gpio);
+}
+
 void setupDisplayAndFonts(bool seamless = false) {
 #if !FREEINK_MCU_C3
   // C3 resolves its controller in HalGPIO::begin() before SPI claims the
@@ -514,6 +572,16 @@ void setup() {
   // only SD state survives to the next boot.
   const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || gpio.verifyPowerButtonWakeup();
 
+  // Deep-lock wake: the press that woke us is tap 1 of the unlock gesture. Decide
+  // before the SD card or display are touched so a stray single press (bag,
+  // pocket) costs ~100 ms awake and goes straight back to sleep, still locked.
+  const bool deepLockWake = wakeupReason == HalGPIO::WakeupReason::PowerButton && deepLockMagic == DEEP_LOCK_MAGIC;
+  deepLockMagic = 0;
+  if (deepLockWake && !gpio.waitForPowerDoubleTap(DEEP_LOCK_TAP_RELEASE_MS, DEEP_LOCK_TAP_WINDOW_MS)) {
+    deepLockMagic = DEEP_LOCK_MAGIC;
+    powerManager.startDeepSleep(gpio);
+  }
+
   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
   // gate recovery on the non-strap Down key (GPIO7) to avoid a stuck-in-recovery loop.
   const auto recoveryButton = (BoardConfig::isX4Pro() || BoardConfig::isX4Classic()) ? MappedInputManager::Button::Down
@@ -575,7 +643,7 @@ void setup() {
     case HalGPIO::WakeupReason::PowerButton:
       // With Short Power Button Press = Sleep, a single click wakes on any
       // device; otherwise the button must still be held (ghost-wake debounce).
-      if (!wakeHoldVerified && SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::SLEEP) {
+      if (!deepLockWake && !wakeHoldVerified && SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::SLEEP) {
         LOG_DBG("MAIN", "Power-button wake not held through verification, sleeping");
         Storage.prepareForDeepSleep();
         powerManager.startDeepSleep(gpio);
@@ -640,8 +708,28 @@ void setup() {
           renderer.cleanupGrayscaleWithFrameBuffer();
         }
 
-        const auto pageHeight = renderer.getScreenHeight();
-        renderer.drawImage(LoadingIcon, 0, pageHeight - LOADINGICON_HEIGHT, LOADINGICON_WIDTH, LOADINGICON_HEIGHT);
+        if (deepLockWake) {
+          // The frame (and the panel) show the page + lock badge. Put the saved
+          // pixels back under the badge and push: the only diff is the badge,
+          // so the unlock is one fast refresh of a 32x32 corner. No loading
+          // icon; the reader loads behind an untouched page.
+          HalFile under;
+          if (Storage.openFileForRead("SLP", LOCK_UNDER_FILE, under)) {
+            uint8_t orientation = 0;
+            uint8_t bytes[32 * 32 / 8];
+            if (under.read(&orientation, 1) == 1 && orientation <= GfxRenderer::LandscapeCounterClockwise &&
+                under.read(bytes, sizeof(bytes)) == static_cast<int>(sizeof(bytes))) {
+              renderer.setOrientation(static_cast<GfxRenderer::Orientation>(orientation));
+              renderer.writeFramebufferRegion(renderer.getScreenWidth() - 8 - 32, 8, 32, 32, bytes);
+              renderer.setOrientation(GfxRenderer::Orientation::Portrait);
+            }
+            under.close();
+          }
+          Storage.remove(LOCK_UNDER_FILE);
+        } else {
+          const auto pageHeight = renderer.getScreenHeight();
+          renderer.drawImage(LoadingIcon, 0, pageHeight - LOADINGICON_HEIGHT, LOADINGICON_WIDTH, LOADINGICON_HEIGHT);
+        }
         if (useDifferentialRefresh) {
           renderer.displayGrayscaleBase(HalDisplay::FAST_REFRESH);
           allowFastInitialReaderRefresh = true;
@@ -922,6 +1010,10 @@ void loop() {
     // lost, and the double-tap window after any press stays fully awake
     // (lastActivityTime resets on every press/release).
     powerManager.setPowerSaving(false);
+    if (millis() - lastActivityTime >= DEEP_LOCK_AFTER_MS && !activityManager.preventAutoSleep()) {
+      enterDeepLockSleep();
+      return;  // not reached: startDeepSleep never returns
+    }
     if (gpio.rawInputActive() || !powerManager.lightSleep(gpio, LOCK_LIGHT_SLEEP_SLICE_MS)) {
       delay(10);
     }

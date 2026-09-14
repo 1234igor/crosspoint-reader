@@ -489,6 +489,7 @@ void releaseSdFontCachesForDecode(const GfxRenderer& renderer) {
 
 void SleepActivity::onEnter() {
   Activity::onEnter();
+  if (silent) return;  // input-lock deep sleep: the panel already shows the page + badge
 
   const bool frameWasInverted = display.isInverted();
 
