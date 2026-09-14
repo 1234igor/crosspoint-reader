@@ -25,6 +25,9 @@
 #include <esp_sntp.h>
 #endif
 
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 
 #include "CrossPointSettings.h"
@@ -158,6 +161,7 @@ RTC_NOINIT_ATTR int32_t deepLockPin;             // power button GPIO, so the ga
 RTC_NOINIT_ATTR uint32_t deepLockPinActiveHigh;  // its pressed level
 static constexpr uint32_t DEEP_LOCK_MAGIC = 0x4C4F434B;  // "LOCK"
 static bool deepLockWakeVerified = false;  // set by deepLockWakeGate() for the rest of setup()
+static void lockTrace(const char* fmt, ...);  // defined with the wake gate below
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
@@ -358,6 +362,7 @@ bool handleInputLockDoubleClick() {
     }
   }
   LOG_INF("LOCK", "Input %s by power-button double-tap", locked ? "locked" : "unlocked");
+  lockTrace(locked ? "locked" : "unlocked");
   return true;
 }
 
@@ -463,6 +468,7 @@ static void enterDeepLockSleep() {
   APP_STATE.saveToFile();
 
   deepSleepInProgress = true;
+  lockTrace("deep-lock enter: orient=%d", static_cast<int>(renderer.getOrientation()));
 
   // Save the frame BEFORE the activity swap: ReaderActivity::onExit() resets
   // the orientation to Portrait, which would move the badge rect and make
@@ -498,6 +504,7 @@ static void enterDeepLockSleep() {
   deepLockPinActiveHigh = BoardConfig::ACTIVE.input.powerActiveHigh ? 1 : 0;
   deepLockMagic = DEEP_LOCK_MAGIC;
   LOG_INF("LOCK", "Deep lock: entering deep sleep");
+  lockTrace("deep-lock sleep: pin=%d", static_cast<int>(deepLockPin));
   powerManager.startDeepSleep(gpio);
 }
 
@@ -505,57 +512,113 @@ static void enterDeepLockSleep() {
 // bus, NVS or display probe is touched: by the time the normal init reaches
 // the power button (~250 ms after the wake edge) a natural double tap is
 // already over. Here the window opens ~60-100 ms after the edge, on raw GPIO.
-// The press that woke the chip is tap 1; it must release within
-// DEEP_LOCK_TAP_RELEASE_MS (a longer press is a hold, not a tap), stay
-// released for DEEP_LOCK_RELEASE_STABLE_MS (contact bounce), and a second
-// press must land within DEEP_LOCK_TAP_WINDOW_MS. Anything else goes straight
-// back to deep sleep, still locked, with the panel still in DSLP, the SD rail
-// still off (the previous sleep's pad holds are untouched) and ~100 ms spent.
+//
+// The gesture decision does NOT depend on the RTC flag, so it survives a
+// bootloader that clears RTC RAM: on every deep-sleep GPIO wake the press that
+// woke the chip is tap 1 and the gate classifies what follows —
+//   hold   : still pressed after DEEP_LOCK_TAP_RELEASE_MS  -> verified wake
+//   tap-tap: released, then a second press within the window -> verified wake
+//   tap    : nothing else                                     -> not verified
+// Only "not verified while the RTC flag says locked" re-sleeps here; without
+// the flag the normal boot path decides (it re-sleeps an unheld click too).
+// So a hold ALWAYS wakes the device: there is no gesture that can strand it.
+static uint16_t gateFlags = 0;  // trace bits for lock.log: 1 entered, 2 held at entry, 4 released, 8 tap2, 16 hold, 32 resleep
+static uint16_t gateReleaseMs = 0;
+static uint16_t gateTap2Ms = 0;
 static void deepLockWakeGate() {
-  if (deepLockMagic != DEEP_LOCK_MAGIC) return;
+  const bool locked = deepLockMagic == DEEP_LOCK_MAGIC;
   deepLockMagic = 0;  // one-shot: any other boot (brownout, panic, USB) comes up unlocked
   if (esp_reset_reason() != ESP_RST_DEEPSLEEP || esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_GPIO) return;
-  const int32_t pin = deepLockPin;
-  if (pin < 0 || pin > 21) return;
-  const bool activeHigh = deepLockPinActiveHigh != 0;
+  // Pin/level from RTC RAM when valid, else the C3 Xteink default (GPIO3, active-low).
+  int32_t pin = deepLockPin;
+  bool activeHigh = deepLockPinActiveHigh != 0;
+  if (pin < 0 || pin > 21) {
+    pin = 3;
+    activeHigh = false;
+  }
+  gateFlags = 1;
   pinMode(pin, activeHigh ? INPUT_PULLDOWN : INPUT_PULLUP);
   const int pressedLevel = activeHigh ? HIGH : LOW;
   const auto pressed = [&] { return digitalRead(pin) == pressedLevel; };
 
-  bool unlocked = false;
-  unsigned long t = millis();
+  bool verified = false;
+  const unsigned long t0 = millis();
+  if (pressed()) gateFlags |= 2;
   while (pressed()) {  // tap 1 still down
-    if (millis() - t > DEEP_LOCK_TAP_RELEASE_MS) goto decided;
+    if (millis() - t0 > DEEP_LOCK_TAP_RELEASE_MS) {
+      gateFlags |= 16;  // a hold: a deliberate wake
+      verified = true;
+      break;
+    }
     delay(2);
   }
-  {
-    // Debounced release: restart the stability clock on any bounce, bounded overall.
-    const unsigned long stableStart = millis();
+  gateReleaseMs = static_cast<uint16_t>(millis() - t0);
+  if (!verified) {
+    // Debounced release, then the tap-2 window.
     unsigned long quietSince = millis();
-    while (millis() - quietSince < DEEP_LOCK_RELEASE_STABLE_MS) {
-      if (pressed()) quietSince = millis();
-      if (millis() - stableStart > DEEP_LOCK_TAP_RELEASE_MS) goto decided;
-      delay(2);
-    }
-  }
-  t = millis();
-  while (millis() - t <= DEEP_LOCK_TAP_WINDOW_MS) {  // tap 2
-    if (pressed()) {
-      delay(20);
+    const unsigned long stableStart = quietSince;
+    bool released = false;
+    while (millis() - stableStart <= DEEP_LOCK_TAP_RELEASE_MS) {
       if (pressed()) {
-        unlocked = true;
+        quietSince = millis();
+      } else if (millis() - quietSince >= DEEP_LOCK_RELEASE_STABLE_MS) {
+        released = true;
         break;
       }
+      delay(2);
     }
-    delay(2);
+    if (released) {
+      gateFlags |= 4;
+      const unsigned long t2 = millis();
+      while (millis() - t2 <= DEEP_LOCK_TAP_WINDOW_MS) {
+        if (pressed()) {
+          delay(20);
+          if (pressed()) {
+            gateFlags |= 8;
+            verified = true;
+            break;
+          }
+        }
+        delay(2);
+      }
+      gateTap2Ms = static_cast<uint16_t>(millis() - t2);
+    }
   }
-decided:
-  if (unlocked) {
-    deepLockWakeVerified = true;
-    return;
-  }
+  deepLockWakeVerified = verified;
+  if (verified || !locked) return;
+  // A lone short press while deep-locked: back to sleep, still locked.
+  gateFlags |= 32;
   deepLockMagic = DEEP_LOCK_MAGIC;
   freeink::PowerManager::deepSleepUntilPowerButton();  // waits for release, re-arms the same wake, never returns
+}
+
+// Lock/wake trace on the SD card (append-only, self-truncating). Cheap and
+// off the hot path; it is what makes a "the lock did not wake" report
+// diagnosable without a serial cable. Read /.crosspoint/lock.log.
+constexpr char LOCK_LOG_FILE[] = "/.crosspoint/lock.log";
+static void lockTrace(const char* fmt, ...) {
+  if (!Storage.ready()) return;
+  char line[160];
+  const int n = snprintf(line, sizeof(line), "%lu ", millis());
+  va_list args;
+  va_start(args, fmt);
+  const int m = vsnprintf(line + n, sizeof(line) - n - 1, fmt, args);
+  va_end(args);
+  const size_t len = static_cast<size_t>(n + (m < 0 ? 0 : std::min(m, static_cast<int>(sizeof(line)) - n - 2)));
+  line[len] = '\n';
+  HalFile f;
+  if (Storage.exists(LOCK_LOG_FILE)) {
+    if (!Storage.openFileForRead("LOG", LOCK_LOG_FILE, f)) return;
+    const bool tooBig = f.size() > 16 * 1024;
+    f.close();
+    if (tooBig) Storage.remove(LOCK_LOG_FILE);
+  }
+  // SdFat: O_RDWR|O_CREAT|O_TRUNC is what openFileForWrite gives; append by reading the
+  // old content first is too costly, so use the raw open with append flags.
+  f = Storage.open(LOCK_LOG_FILE, O_RDWR | O_CREAT | O_APPEND);
+  if (!f) return;
+  f.write(line, len + 1);
+  f.close();
 }
 
 void setupDisplayAndFonts(bool seamless = false) {
@@ -641,10 +704,8 @@ void setup() {
   // boot — but defer the sleep-or-boot decision until SETTINGS is loaded below:
   // click-to-wake is a setting, and an X4 battery power-off cuts all power, so
   // only SD state survives to the next boot.
-  const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || gpio.verifyPowerButtonWakeup();
-
-  // Deep-lock wake: deepLockWakeGate() already verified the double tap.
-  const bool deepLockWake = deepLockWakeVerified && wakeupReason == HalGPIO::WakeupReason::PowerButton;
+  const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || deepLockWakeVerified ||
+                                gpio.verifyPowerButtonWakeup();
 
   // X4 Pro and X4 Classic both map BTN_UP to GPIO0 — an ESP32-S3 boot strap — so
   // gate recovery on the non-strap Down key (GPIO7) to avoid a stuck-in-recovery loop.
@@ -672,6 +733,16 @@ void setup() {
   }
 
   HalSystem::checkPanic();
+
+  // Deep-lock wake: the gate verified the gesture and the marker file (written
+  // only by enterDeepLockSleep, removed by every wake) says the panel shows a
+  // locked page. The RTC flag is deliberately not required here.
+  const bool deepLockWake = deepLockWakeVerified && wakeupReason == HalGPIO::WakeupReason::PowerButton &&
+                            Storage.exists(LOCK_UNDER_FILE);
+  lockTrace("boot reset=%d wake=%d reason=%d gate=0x%x rel=%u tap2=%u verified=%d deepLockWake=%d",
+            static_cast<int>(esp_reset_reason()), static_cast<int>(esp_sleep_get_wakeup_cause()),
+            static_cast<int>(wakeupReason), gateFlags, gateReleaseMs, gateTap2Ms, deepLockWakeVerified ? 1 : 0,
+            deepLockWake ? 1 : 0);
 
   APP_STATE.loadFromFile();
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
@@ -709,6 +780,7 @@ void setup() {
       // device; otherwise the button must still be held (ghost-wake debounce).
       if (!deepLockWake && !wakeHoldVerified && SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::SLEEP) {
         LOG_DBG("MAIN", "Power-button wake not held through verification, sleeping");
+        lockTrace("unverified click wake: sleeping");
         Storage.prepareForDeepSleep();
         powerManager.startDeepSleep(gpio);
       }
@@ -764,6 +836,7 @@ void setup() {
       // us in a splashless-with-no-frame loop on the next boot.
       APP_STATE.showBootScreen = true;
       APP_STATE.saveToFile();
+      if (!deepLockWake && Storage.exists(LOCK_UNDER_FILE)) Storage.remove(LOCK_UNDER_FILE);
       if (Storage.exists(SLEEP_FRAME_FILE) && loadSleepFrameBuffer()) {
         const bool useDifferentialRefresh = gpio.deviceIsX3();
         if (useDifferentialRefresh) {
@@ -792,6 +865,7 @@ void setup() {
             under.close();
           }
           Storage.remove(LOCK_UNDER_FILE);
+          lockTrace("deep-lock wake: frame restored, badge cleared");
         } else {
           const auto pageHeight = renderer.getScreenHeight();
           renderer.drawImage(LoadingIcon, 0, pageHeight - LOADINGICON_HEIGHT, LOADINGICON_WIDTH, LOADINGICON_HEIGHT);
