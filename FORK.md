@@ -39,15 +39,24 @@ Rules that keep rebases painless:
    as the FIRST line of `setup()` on raw GPIO (the normal init reaches the button
    ~250 ms after the wake edge, too late for a natural double tap). A lone tap
    re-sleeps via `freeink::PowerManager::deepSleepUntilPowerButton()` with nothing
-   initialized. **Hardware fact learned the hard way (lock.log, 2026-09-14):** the
-   stock sleep path drives GPIO13 LOW, which on the X3 is the battery power-off, so a
-   "deep-sleep wake" is really a cold boot (reset=POWERON, RTC RAM lost, full image
-   validation, ~1 s before setup()) — no double tap can survive that. The deep lock
-   therefore uses `HalPowerManager::startRetainedDeepSleep()`: GPIO13 held HIGH, panel
-   RESET held, chip in real deep sleep with the button armed; wake is ~100 ms with RTC
-   intact. Cost: the SD card and rails stay powered (expect well under 1 mA, vs the
-   12.8 µA of a true power-off); `/.crosspoint/lock.log` records battery % at lock and
-   at every boot so the real drain can be read off the card.
+   initialized. **Hardware facts from the device's own lock.log (2026-09-14), which
+   outrank any comment:** (1) the stock sleep path drives GPIO13 LOW and on this X3
+   that cuts power to the chip — the next press is reset=POWERON, RTC RAM gone, ~1 s of
+   image validation before setup(); no double tap can survive that, only a hold wakes
+   it. (2) With GPIO13 held HIGH and a real `esp_deep_sleep_start`
+   (`HalPowerManager::startRetainedDeepSleep`) the wake is reset=8/wake=7, the gate
+   ran ~60 ms in and caught tap 2 every time (`gate=0xf rel=16-62 tap2=80-120`).
+   (3) That build still drained ~12 mA asleep: `esp_sleep_config_gpio_isolate` floats
+   every unheld pad and the powered SD card sat on a floating CS/SCLK. r9 holds every
+   bus pad (SD CS 12 HIGH, display CS 21 HIGH, SCLK 8 LOW, MOSI 10 HIGH, DC 4, MISO/BUSY
+   pulled up, RST 5 HIGH, GPIO13 HIGH) and releases them first thing on wake
+   (`releaseRetainedSleepHolds`; held pads ignore muxing). (4) The lock's light sleep
+   ignores the USB heuristic (X3 infers USB from the gauge's charge-current sign) and a
+   declined sleep idles at 10 MHz, not 160. Every lock/unlock/sleep/boot line logs
+   battery %, gauge current and the RTC clock; two lines bracketing a sleep give the
+   average sleep current (% delta x 6.5 mAh / hours). A 12.8 µA power-off is
+   unreachable with a fast wake on this board; the target is the SD card's standby,
+   expected 0.3-0.8 mA.
    A hit restores the saved frame minus the badge with one FAST refresh and reloads
    the reader behind it. Two reviewer passes (2026-09-14) signed off on this shape;
    the alternative they offered is a 300 ms hold instead of tap-tap if the double
