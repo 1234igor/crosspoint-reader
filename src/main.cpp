@@ -162,6 +162,7 @@ RTC_NOINIT_ATTR uint32_t deepLockPinActiveHigh;  // its pressed level
 static constexpr uint32_t DEEP_LOCK_MAGIC = 0x4C4F434B;  // "LOCK"
 static bool deepLockWakeVerified = false;  // set by deepLockWakeGate() for the rest of setup()
 static void lockTrace(const char* fmt, ...);  // defined with the wake gate below
+static void lockTraceState(const char* tag);
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
@@ -362,7 +363,7 @@ bool handleInputLockDoubleClick() {
     }
   }
   LOG_INF("LOCK", "Input %s by power-button double-tap", locked ? "locked" : "unlocked");
-  lockTrace(locked ? "locked" : "unlocked");
+  lockTraceState(locked ? "locked" : "unlocked");
   return true;
 }
 
@@ -504,8 +505,7 @@ static void enterDeepLockSleep() {
   deepLockPinActiveHigh = BoardConfig::ACTIVE.input.powerActiveHigh ? 1 : 0;
   deepLockMagic = DEEP_LOCK_MAGIC;
   LOG_INF("LOCK", "Deep lock: entering retained deep sleep");
-  lockTrace("deep-lock sleep (retained): pin=%d battery=%u%%", static_cast<int>(deepLockPin),
-            powerManager.getBatteryPercentage());
+  lockTraceState("deep-lock sleep (retained)");
   powerManager.startRetainedDeepSleep(gpio);
 }
 
@@ -597,6 +597,16 @@ static void deepLockWakeGate() {
 // off the hot path; it is what makes a "the lock did not wake" report
 // diagnosable without a serial cable. Read /.crosspoint/lock.log.
 constexpr char LOCK_LOG_FILE[] = "/.crosspoint/lock.log";
+// Battery %, gauge current (mA) and the RTC clock, so two lines bracket a sleep
+// with real numbers: % delta x 6.5 mAh / elapsed hours = average sleep current.
+static void lockTraceState(const char* tag) {
+  int16_t currentMa = 0;
+  const bool haveCurrent = gpio.readBatteryCurrentMa(currentMa);
+  uint8_t hh = 0, mm = 0;
+  const bool haveClock = halClock.getTime(hh, mm);
+  lockTrace("%s battery=%u%% cur=%d%s clock=%02u:%02u%s", tag, powerManager.getBatteryPercentage(),
+            haveCurrent ? currentMa : 0, haveCurrent ? "mA" : "mA?", hh, mm, haveClock ? "" : "?");
+}
 static void lockTrace(const char* fmt, ...) {
   if (!Storage.ready()) return;
   char line[160];
@@ -670,6 +680,7 @@ void setupDisplayAndFonts(bool seamless = false) {
 
 void setup() {
   deepLockWakeGate();  // must stay first: see its comment
+  HalPowerManager::releaseRetainedSleepHolds();  // before any bus/storage init (held pads ignore muxing)
   BoardConfig::holdPowerRails();
 
 #ifdef ENABLE_SERIAL_LOG
@@ -740,10 +751,11 @@ void setup() {
   // locked page. The RTC flag is deliberately not required here.
   const bool deepLockWake = deepLockWakeVerified && wakeupReason == HalGPIO::WakeupReason::PowerButton &&
                             Storage.exists(LOCK_UNDER_FILE);
-  lockTrace("boot reset=%d wake=%d reason=%d gate=0x%x rel=%u tap2=%u verified=%d deepLockWake=%d battery=%u%%",
+  lockTrace("boot reset=%d wake=%d reason=%d gate=0x%x rel=%u tap2=%u verified=%d deepLockWake=%d",
             static_cast<int>(esp_reset_reason()), static_cast<int>(esp_sleep_get_wakeup_cause()),
             static_cast<int>(wakeupReason), gateFlags, gateReleaseMs, gateTap2Ms, deepLockWakeVerified ? 1 : 0,
-            deepLockWake ? 1 : 0, powerManager.getBatteryPercentage());
+            deepLockWake ? 1 : 0);
+  lockTraceState("boot");
 
   APP_STATE.loadFromFile();
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
@@ -1150,12 +1162,24 @@ void loop() {
     // A raw contact mid-debounce polls at 100 Hz instead so a tap is never
     // lost, and the double-tap window after any press stays fully awake
     // (lastActivityTime resets on every press/release).
-    powerManager.setPowerSaving(false);
     if (millis() - lastActivityTime >= DEEP_LOCK_AFTER_MS && !activityManager.preventAutoSleep()) {
       enterDeepLockSleep();
-      return;  // not reached: startDeepSleep never returns
+      return;  // not reached: the sleep never returns
     }
-    if (gpio.rawInputActive() || !powerManager.lightSleep(gpio, LOCK_LIGHT_SLEEP_SLICE_MS)) {
+    if (gpio.rawInputActive()) {
+      powerManager.setPowerSaving(false);  // a press is being debounced: full clock for the response
+      delay(10);
+    } else if (powerManager.lightSleep(gpio, LOCK_LIGHT_SLEEP_SLICE_MS, /*ignoreUsb=*/true)) {
+      powerManager.setPowerSaving(false);  // race-to-sleep: the awake window runs at full clock
+    } else {
+      // Declined (performance lock held, WiFi, or a rejected sleep): idle at 10 MHz
+      // instead of 160 so a broken light sleep costs ~10 mA, not ~14, until deep lock.
+      static bool traced = false;
+      if (!traced) {
+        traced = true;
+        lockTrace("light sleep declined: status=%d", powerManager.lastLightSleepStatus());
+      }
+      powerManager.setPowerSaving(true);
       delay(10);
     }
   } else {

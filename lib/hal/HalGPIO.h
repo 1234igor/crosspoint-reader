@@ -118,6 +118,9 @@ class HalGPIO {
 
   // Check if USB is connected
   bool isUsbConnected() const;
+  // X3 fuel gauge Current() register in mA (signed; sign convention is the
+  // gauge's, unverified on every unit). False on boards without the gauge.
+  bool readBatteryCurrentMa(int16_t& outMa) const;
   // Last sampled USB verdict (update() polls it once per USB_POLL_MS).
   bool isUsbConnectedCached() const { return lastUsbConnected; }
   static constexpr unsigned long USB_POLL_MS = 1000;

@@ -67,12 +67,22 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   // Otherwise, no change needed
 }
 
-bool HalPowerManager::lightSleep(const HalGPIO& gpio, const unsigned long sliceMs) const {
+bool HalPowerManager::lightSleep(const HalGPIO& gpio, const unsigned long sliceMs, const bool ignoreUsb) const {
   // Read without the mutex, like setPowerSaving(): a stale lock delays sleeping
   // by one slice; a Lock taken after this check freezes that task for at most
   // one slice (timer wake; state retained).
-  if (currentLockMode != None) return false;
-  if (WiFi.getMode() != WIFI_MODE_NULL || gpio.isUsbConnectedCached()) return false;
+  if (currentLockMode != None) {
+    lastLightSleepStatus_ = 1;
+    return false;
+  }
+  if (WiFi.getMode() != WIFI_MODE_NULL) {
+    lastLightSleepStatus_ = 2;
+    return false;
+  }
+  if (!ignoreUsb && gpio.isUsbConnectedCached()) {
+    lastLightSleepStatus_ = 3;
+    return false;
+  }
 
   esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(sliceMs) * 1000ULL);
   const int8_t powerPin = BoardConfig::ACTIVE.input.power;
@@ -108,6 +118,7 @@ bool HalPowerManager::lightSleep(const HalGPIO& gpio, const unsigned long sliceM
     gpio_set_intr_type(static_cast<gpio_num_t>(powerPin), GPIO_INTR_DISABLE);
   }
 
+  lastLightSleepStatus_ = static_cast<int>(err);
   if (err != ESP_OK) {
     static bool warned = false;
     if (!warned) {
@@ -117,6 +128,41 @@ bool HalPowerManager::lightSleep(const HalGPIO& gpio, const unsigned long sliceM
     return false;
   }
   return true;
+}
+
+namespace {
+// Pads held through the retained deep sleep. esp_sleep_config_gpio_isolate()
+// floats every pad it does not find held; a powered SD card on a floating
+// CS/SCLK draws milliamps (its interface toggles on noise), which is what a
+// locked X3 measured at ~12 mA. Hold every bus line at its idle level.
+void holdOutputForSleep(const int8_t pin, const uint8_t level) {
+  if (pin < 0) return;
+  const auto g = static_cast<gpio_num_t>(pin);
+  gpio_hold_dis(g);
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, level);
+  gpio_hold_en(g);
+}
+void holdInputForSleep(const int8_t pin) {
+  if (pin < 0) return;
+  const auto g = static_cast<gpio_num_t>(pin);
+  gpio_hold_dis(g);
+  pinMode(pin, INPUT_PULLUP);
+  gpio_hold_en(g);
+}
+void releaseHold(const int8_t pin) {
+  if (pin >= 0) gpio_hold_dis(static_cast<gpio_num_t>(pin));
+}
+}  // namespace
+
+void HalPowerManager::releaseRetainedSleepHolds() {
+  const auto& b = BoardConfig::ACTIVE;
+  for (const int8_t pin : {b.display.sclk, b.display.mosi, b.display.cs, b.display.dc, b.display.busy, b.sd.sclk,
+                           b.sd.miso, b.sd.mosi, b.sd.cs}) {
+    releaseHold(pin);
+  }
+  // GPIO13 (latch) and display RST are released by SDCardManager::begin() /
+  // the EPD bus reset on their own init paths, exactly as after a stock sleep.
 }
 
 void HalPowerManager::startRetainedDeepSleep(HalGPIO& gpio) const {
@@ -131,17 +177,21 @@ void HalPowerManager::startRetainedDeepSleep(HalGPIO& gpio) const {
     gpio_set_direction(XTEINK_C3_GPIO13, GPIO_MODE_OUTPUT);
     gpio_set_level(XTEINK_C3_GPIO13, 1);
     gpio_hold_en(XTEINK_C3_GPIO13);
-    // Panel rail stays powered too: keep its RESET defined HIGH so the
-    // controller cannot drift out of DSLP (same rule powerDownRailsForSleep
-    // applies to boards with a powered panel rail).
-    const int8_t rst = BoardConfig::ACTIVE.display.rst;
-    if (rst >= 0) {
-      const auto g = static_cast<gpio_num_t>(rst);
-      gpio_hold_dis(g);
-      pinMode(rst, OUTPUT);
-      digitalWrite(rst, HIGH);
-      gpio_hold_en(g);
-    }
+    // Everything on the board stays powered, so every bus line must sit at a
+    // defined idle level or the SD card / panel see noise and burn milliamps.
+    const auto& b = BoardConfig::ACTIVE;
+    holdOutputForSleep(b.display.rst, HIGH);  // panel stays in DSLP (powered rail rule)
+    holdOutputForSleep(b.display.cs, HIGH);   // deselected
+    holdOutputForSleep(b.display.dc, LOW);
+    holdInputForSleep(b.display.busy);
+    holdOutputForSleep(b.sd.cs, HIGH);        // deselected: card drops to standby
+    holdInputForSleep(b.sd.miso);
+    // Shared SPI clock/data (X3/X4: SCLK 8, MOSI 10 serve both). Clock low, data
+    // high is the SD idle convention.
+    holdOutputForSleep(b.display.sclk, LOW);
+    holdOutputForSleep(b.display.mosi, HIGH);
+    holdOutputForSleep(b.sd.sclk, LOW);
+    holdOutputForSleep(b.sd.mosi, HIGH);
     freeink::PowerManager::deepSleepUntilPowerButton();
   }
 #endif

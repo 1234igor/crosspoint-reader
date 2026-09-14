@@ -248,6 +248,10 @@ bool HalGPIO::verifyPowerButtonWakeup() {
   return heldAtFirstSample && inputMgr.isPowerButtonPhysicallyPressed();
 }
 
+bool HalGPIO::readBatteryCurrentMa(int16_t& outMa) const {
+  return deviceIsX3() && X3GPIO::readBQ27220CurrentMA(&outMa);
+}
+
 bool HalGPIO::isUsbConnected() const {
   if (deviceIsX3()) {
     // X3: infer USB/charging via BQ27220 Current() register (0x0C, signed mA).
