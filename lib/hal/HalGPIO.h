@@ -26,6 +26,8 @@
 #define I2C_ADDR_BQ27220 0x55  // Fuel gauge I2C address
 #define BQ27220_SOC_REG 0x2C   // StateOfCharge() command code (%)
 #define BQ27220_CUR_REG 0x0C   // Current() command code (signed mA)
+#define BQ27220_REMCAP_REG 0x10  // RemainingCapacity() (mAh)
+#define BQ27220_FCC_REG 0x12     // FullChargeCapacity() (mAh)
 #define BQ27220_VOLT_REG 0x08  // Voltage() command code (mV)
 
 // Analog DS3231 RTC I2C
@@ -121,6 +123,10 @@ class HalGPIO {
   // X3 fuel gauge Current() register in mA (signed; sign convention is the
   // gauge's, unverified on every unit). False on boards without the gauge.
   bool readBatteryCurrentMa(int16_t& outMa) const;
+  // X3 fuel gauge RemainingCapacity / FullChargeCapacity in mAh. The gauge
+  // integrates current on its own while the chip sleeps, so two readings
+  // bracketing a sleep give its true average current.
+  bool readBatteryRemainingMah(uint16_t& remMah, uint16_t& fullMah) const;
   // Last sampled USB verdict (update() polls it once per USB_POLL_MS).
   bool isUsbConnectedCached() const { return lastUsbConnected; }
   static constexpr unsigned long USB_POLL_MS = 1000;

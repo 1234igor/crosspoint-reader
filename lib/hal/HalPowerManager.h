@@ -63,7 +63,9 @@ class HalPowerManager {
   // (~100 ms, RTC retained) so its double tap can be judged in time, so it
   // holds GPIO13 HIGH and the panel reset defined, arms the power button and
   // sleeps the chip only. Non-Xteink boards fall back to startDeepSleep().
-  [[noreturn]] void startRetainedDeepSleep(HalGPIO& gpio) const;
+  // maxSleepUs > 0 also arms a timer wake: the caller caps how long the board
+  // stays powered (the input lock turns it into a real power-off at the cap).
+  [[noreturn]] void startRetainedDeepSleep(HalGPIO& gpio, uint64_t maxSleepUs = 0) const;
   // Release the pad holds startRetainedDeepSleep() armed. Must run on the
   // wake path BEFORE any bus or storage init: a held pad silently ignores
   // pinMode/SPI muxing, so SD and display init would fail against it.

@@ -252,6 +252,11 @@ bool HalGPIO::readBatteryCurrentMa(int16_t& outMa) const {
   return deviceIsX3() && X3GPIO::readBQ27220CurrentMA(&outMa);
 }
 
+bool HalGPIO::readBatteryRemainingMah(uint16_t& remMah, uint16_t& fullMah) const {
+  return deviceIsX3() && X3GPIO::readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_REMCAP_REG, &remMah) &&
+         X3GPIO::readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_FCC_REG, &fullMah);
+}
+
 bool HalGPIO::isUsbConnected() const {
   if (deviceIsX3()) {
     // X3: infer USB/charging via BQ27220 Current() register (0x0C, signed mA).

@@ -158,14 +158,14 @@ void releaseHold(const int8_t pin) {
 void HalPowerManager::releaseRetainedSleepHolds() {
   const auto& b = BoardConfig::ACTIVE;
   for (const int8_t pin : {b.display.sclk, b.display.mosi, b.display.cs, b.display.dc, b.display.busy, b.sd.sclk,
-                           b.sd.miso, b.sd.mosi, b.sd.cs}) {
+                           b.sd.miso, b.sd.mosi, b.sd.cs, b.batteryGauge.i2cSda, b.batteryGauge.i2cScl}) {
     releaseHold(pin);
   }
   // GPIO13 (latch) and display RST are released by SDCardManager::begin() /
   // the EPD bus reset on their own init paths, exactly as after a stock sleep.
 }
 
-void HalPowerManager::startRetainedDeepSleep(HalGPIO& gpio) const {
+void HalPowerManager::startRetainedDeepSleep(HalGPIO& gpio, const uint64_t maxSleepUs) const {
 #if !SOC_PM_SUPPORT_EXT1_WAKEUP
   if (gpio.isXteinkDevice()) {
 #ifdef ENABLE_SERIAL_LOG
@@ -192,6 +192,11 @@ void HalPowerManager::startRetainedDeepSleep(HalGPIO& gpio) const {
     holdOutputForSleep(b.display.mosi, HIGH);
     holdOutputForSleep(b.sd.sclk, LOW);
     holdOutputForSleep(b.sd.mosi, HIGH);
+    // Gauge/RTC/IMU I2C bus: isolation would float SDA/SCL (the awake bus runs
+    // on the pads' pull-ups). Keep them pulled up like the awake idle bus.
+    holdInputForSleep(b.batteryGauge.i2cSda);
+    holdInputForSleep(b.batteryGauge.i2cScl);
+    if (maxSleepUs > 0) esp_sleep_enable_timer_wakeup(maxSleepUs);
     freeink::PowerManager::deepSleepUntilPowerButton();
   }
 #endif

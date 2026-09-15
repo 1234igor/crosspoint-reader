@@ -14,6 +14,7 @@
 #include <HalTiltSensor.h>
 #include <PowerManager.h>
 #include <esp_sleep.h>
+#include <esp_rtc_time.h>
 #include <esp_system.h>
 #include <I18n.h>
 #include <Logging.h>
@@ -72,10 +73,16 @@ constexpr unsigned long LOCK_LIGHT_SLEEP_AFTER_MS = 1000;
 constexpr unsigned long LOCK_LIGHT_SLEEP_SLICE_MS = 1000;
 // After an unlock with no page turn, refresh once to take the badge off the panel.
 constexpr unsigned long INPUT_LOCK_CLEAR_DELAY_MS = 1500;
-// Deep lock: after this much quiet while locked, deep-sleep (12.8 uA) with the
-// page + badge left on the panel. Unlock is then tap, tap: the first tap wakes
-// the chip, setup() waits for the second before touching the SD card.
+// Deep lock: after this much quiet while locked, deep-sleep with the board kept
+// powered and the page + badge left on the panel. Unlock is then tap, tap: the
+// first tap wakes the chip, setup() waits for the second before touching SD.
 constexpr unsigned long DEEP_LOCK_AFTER_MS = 30000;
+// The powered ("retained") deep sleep measured ~10 mA on the X3 (r8 and r9
+// lock.log: 1.5-1.8 %/h), about the rate of upstream's pre-fix X3 standby bug.
+// Cap it: after this long a timer wake logs the measured current and does the
+// stock battery power-off, page still on the panel. Unlock after the cap is a
+// ~1 s hold (cold boot), restored exactly like a tap-tap wake.
+constexpr uint64_t DEEP_LOCK_RETAINED_MAX_US = 20ULL * 60ULL * 1000000ULL;
 constexpr unsigned long DEEP_LOCK_TAP_RELEASE_MS = 400;  // tap 1 must release within this after boot
 constexpr unsigned long DEEP_LOCK_TAP_WINDOW_MS = 800;   // tap 2 must land within this after tap 1 releases
 constexpr unsigned long DEEP_LOCK_RELEASE_STABLE_MS = 15;  // release must hold this long (contact bounce)
@@ -159,8 +166,15 @@ RTC_NOINIT_ATTR uint32_t silentRebootTarget;
 RTC_NOINIT_ATTR uint32_t deepLockMagic;
 RTC_NOINIT_ATTR int32_t deepLockPin;             // power button GPIO, so the gate needs no BoardConfig
 RTC_NOINIT_ATTR uint32_t deepLockPinActiveHigh;  // its pressed level
+// Sleep measurement + cap bookkeeping (valid only while deepLockMagic was set).
+RTC_NOINIT_ATTR uint64_t deepLockEnterUs;     // esp_rtc_get_time_us() at sleep entry
+RTC_NOINIT_ATTR uint64_t deepLockDeadlineUs;  // entry + DEEP_LOCK_RETAINED_MAX_US
+RTC_NOINIT_ATTR uint32_t deepLockEnterMah;    // gauge RemainingCapacity at entry, 0xFFFF unknown
+RTC_NOINIT_ATTR uint32_t deepLockGateWakes;   // lone/stray presses the gate put back to sleep
 static constexpr uint32_t DEEP_LOCK_MAGIC = 0x4C4F434B;  // "LOCK"
 static bool deepLockWakeVerified = false;  // set by deepLockWakeGate() for the rest of setup()
+static bool deepLockCapWake = false;       // the retained-sleep cap timer fired while locked
+static bool deepLockStatsValid = false;    // the RTC measurement vars above belong to this sleep
 static void lockTrace(const char* fmt, ...);  // defined with the wake gate below
 static void lockTraceState(const char* tag);
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
@@ -503,10 +517,17 @@ static void enterDeepLockSleep() {
   Storage.prepareForDeepSleep();
   deepLockPin = BoardConfig::ACTIVE.input.power;
   deepLockPinActiveHigh = BoardConfig::ACTIVE.input.powerActiveHigh ? 1 : 0;
+  {
+    uint16_t remMah = 0, fullMah = 0;
+    deepLockEnterMah = gpio.readBatteryRemainingMah(remMah, fullMah) ? remMah : 0xFFFF;
+  }
+  deepLockEnterUs = esp_rtc_get_time_us();
+  deepLockDeadlineUs = deepLockEnterUs + DEEP_LOCK_RETAINED_MAX_US;
+  deepLockGateWakes = 0;
   deepLockMagic = DEEP_LOCK_MAGIC;
   LOG_INF("LOCK", "Deep lock: entering retained deep sleep");
   lockTraceState("deep-lock sleep (retained)");
-  powerManager.startRetainedDeepSleep(gpio);
+  powerManager.startRetainedDeepSleep(gpio, DEEP_LOCK_RETAINED_MAX_US);
 }
 
 // Deep-lock wake gate. Runs as the FIRST thing in setup(), before any rail,
@@ -529,7 +550,14 @@ static uint16_t gateTap2Ms = 0;
 static void deepLockWakeGate() {
   const bool locked = deepLockMagic == DEEP_LOCK_MAGIC;
   deepLockMagic = 0;  // one-shot: any other boot (brownout, panic, USB) comes up unlocked
-  if (esp_reset_reason() != ESP_RST_DEEPSLEEP || esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_GPIO) return;
+  deepLockStatsValid = locked;
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP) return;
+  const auto cause = esp_sleep_get_wakeup_cause();
+  if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+    deepLockCapWake = locked;  // setup() logs the measurement and powers off
+    return;
+  }
+  if (cause != ESP_SLEEP_WAKEUP_GPIO) return;
   // Pin/level from RTC RAM when valid, else the C3 Xteink default (GPIO3, active-low).
   int32_t pin = deepLockPin;
   bool activeHigh = deepLockPinActiveHigh != 0;
@@ -590,6 +618,11 @@ static void deepLockWakeGate() {
   // A lone short press while deep-locked: back to sleep, still locked.
   gateFlags |= 32;
   deepLockMagic = DEEP_LOCK_MAGIC;
+  deepLockGateWakes = deepLockGateWakes + 1;
+  // Re-arm the cap with the time that is left (the timer config does not
+  // survive the reset): a stray press must not restart the powered phase.
+  const uint64_t now = esp_rtc_get_time_us();
+  esp_sleep_enable_timer_wakeup(deepLockDeadlineUs > now + 1000000ULL ? deepLockDeadlineUs - now : 1000000ULL);
   freeink::PowerManager::deepSleepUntilPowerButton();  // waits for release, re-arms the same wake, never returns
 }
 
@@ -602,10 +635,30 @@ constexpr char LOCK_LOG_FILE[] = "/.crosspoint/lock.log";
 static void lockTraceState(const char* tag) {
   int16_t currentMa = 0;
   const bool haveCurrent = gpio.readBatteryCurrentMa(currentMa);
-  uint8_t hh = 0, mm = 0;
-  const bool haveClock = halClock.getTime(hh, mm);
-  lockTrace("%s battery=%u%% cur=%d%s clock=%02u:%02u%s", tag, powerManager.getBatteryPercentage(),
-            haveCurrent ? currentMa : 0, haveCurrent ? "mA" : "mA?", hh, mm, haveClock ? "" : "?");
+  uint16_t remMah = 0, fullMah = 0;
+  const bool haveCap = gpio.readBatteryRemainingMah(remMah, fullMah);
+  // up = RTC seconds since power-on; it keeps counting through deep sleep, so
+  // two lines of one power-on give real elapsed time (the DS3231 is unsynced).
+  lockTrace("%s battery=%u%% cur=%d%s rem=%u/%umAh%s up=%lus", tag, powerManager.getBatteryPercentage(),
+            haveCurrent ? currentMa : 0, haveCurrent ? "mA" : "mA?", remMah, fullMah, haveCap ? "" : "?",
+            static_cast<unsigned long>(esp_rtc_get_time_us() / 1000000ULL));
+}
+// The lock sleep that just ended, measured by the gauge: mAh used over RTC
+// seconds. This is the number every power claim about the lock must cite.
+static void logDeepLockSleepStats(const char* tag) {
+  const uint64_t now = esp_rtc_get_time_us();
+  const unsigned long secs =
+      now > deepLockEnterUs ? static_cast<unsigned long>((now - deepLockEnterUs) / 1000000ULL) : 0;
+  uint16_t remMah = 0, fullMah = 0;
+  const bool haveCap = gpio.readBatteryRemainingMah(remMah, fullMah);
+  const int usedMah = (haveCap && deepLockEnterMah <= 0xFFFE) ? static_cast<int>(deepLockEnterMah) - remMah : -9999;
+  char avg[16] = "?";
+  if (usedMah != -9999 && secs > 0) {
+    const long tenths = static_cast<long>(usedMah) * 36000L / static_cast<long>(secs);
+    snprintf(avg, sizeof(avg), "%s%ld.%ld", tenths < 0 ? "-" : "", labs(tenths) / 10, labs(tenths) % 10);
+  }
+  lockTrace("deep-lock %s: slept %lus rem %lu->%u mAh avg %s mA stray-wakes %lu", tag, secs,
+            static_cast<unsigned long>(deepLockEnterMah), remMah, avg, static_cast<unsigned long>(deepLockGateWakes));
 }
 static void lockTrace(const char* fmt, ...) {
   if (!Storage.ready()) return;
@@ -739,6 +792,7 @@ void setup() {
   // We need 6 open files concurrently when parsing a new chapter
   if (!Storage.begin()) {
     LOG_ERR("MAIN", "SD card initialization failed");
+    if (deepLockCapWake) powerManager.startDeepSleep(gpio);  // never paint over the locked page
     setupDisplayAndFonts(isSilentReboot);
     activityManager.goToFullScreenMessage("SD card error", EpdFontFamily::BOLD);
     return;
@@ -749,13 +803,27 @@ void setup() {
   // Deep-lock wake: the gate verified the gesture and the marker file (written
   // only by enterDeepLockSleep, removed by every wake) says the panel shows a
   // locked page. The RTC flag is deliberately not required here.
-  const bool deepLockWake = deepLockWakeVerified && wakeupReason == HalGPIO::WakeupReason::PowerButton &&
-                            Storage.exists(LOCK_UNDER_FILE);
+  // After the retained-sleep cap the lock is a real power-off: the wake is a
+  // cold boot (POWERON) and only a verified hold gets here. Same restore.
+  const bool coldHoldWake = esp_reset_reason() == ESP_RST_POWERON && wakeHoldVerified;
+  const bool deepLockWake = (deepLockWakeVerified || coldHoldWake) &&
+                            wakeupReason == HalGPIO::WakeupReason::PowerButton && Storage.exists(LOCK_UNDER_FILE);
   lockTrace("boot reset=%d wake=%d reason=%d gate=0x%x rel=%u tap2=%u verified=%d deepLockWake=%d",
             static_cast<int>(esp_reset_reason()), static_cast<int>(esp_sleep_get_wakeup_cause()),
             static_cast<int>(wakeupReason), gateFlags, gateReleaseMs, gateTap2Ms, deepLockWakeVerified ? 1 : 0,
             deepLockWake ? 1 : 0);
   lockTraceState("boot");
+  if (deepLockStatsValid && (deepLockCapWake || deepLockWakeVerified)) {
+    logDeepLockSleepStats(deepLockCapWake ? "cap" : "wake");
+  }
+  if (deepLockCapWake) {
+    // Retained-sleep cap reached while locked: nothing has touched the panel
+    // (display init is below), the IMU was put in standby by begin(). Stock
+    // power-off; the marker + saved frame stay for the hold wake.
+    lockTrace("deep-lock cap: powering off (unlock = hold power ~1 s)");
+    Storage.prepareForDeepSleep();
+    powerManager.startDeepSleep(gpio);
+  }
 
   APP_STATE.loadFromFile();
   const bool isSleepWake = wakeupReason == HalGPIO::WakeupReason::PowerButton;
