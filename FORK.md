@@ -46,17 +46,21 @@ Rules that keep rebases painless:
    it. (2) With GPIO13 held HIGH and a real `esp_deep_sleep_start`
    (`HalPowerManager::startRetainedDeepSleep`) the wake is reset=8/wake=7, the gate
    ran ~60 ms in and caught tap 2 every time (`gate=0xf rel=16-62 tap2=80-120`).
-   (3) That build still drained ~12 mA asleep: `esp_sleep_config_gpio_isolate` floats
-   every unheld pad and the powered SD card sat on a floating CS/SCLK. r9 holds every
-   bus pad (SD CS 12 HIGH, display CS 21 HIGH, SCLK 8 LOW, MOSI 10 HIGH, DC 4, MISO/BUSY
-   pulled up, RST 5 HIGH, GPIO13 HIGH) and releases them first thing on wake
-   (`releaseRetainedSleepHolds`; held pads ignore muxing). (4) The lock's light sleep
-   ignores the USB heuristic (X3 infers USB from the gauge's charge-current sign) and a
-   declined sleep idles at 10 MHz, not 160. Every lock/unlock/sleep/boot line logs
-   battery %, gauge current and the RTC clock; two lines bracketing a sleep give the
-   average sleep current (% delta x 6.5 mAh / hours). A 12.8 µA power-off is
-   unreachable with a fast wake on this board; the target is the SD card's standby,
-   expected 0.3-0.8 mA.
+   (3) That powered sleep drains ~10 mA (1.5-1.9 %/h) whatever the pads do: r9 held
+   every SPI pad and one uninterrupted 19 h sleep still went 60 % -> 30 %. The
+   "floating SD bus" theory was false; the consumer is unidentified. (4) The lock's
+   light sleep ignores the USB heuristic (X3 infers USB from the gauge's
+   charge-current sign) and a declined sleep idles at 10 MHz. (5) r10 bounds the
+   drain: the powered sleep carries a 20-min timer wake (`DEEP_LOCK_RETAINED_MAX_US`);
+   the gate flags it, `setup()` logs the gauge-measured stats after `Storage.begin()`
+   and does the stock power-off (GPIO13 LOW) before any display init, page still on
+   the panel. A verified hold from that cold boot (`coldHoldWake`) takes the same
+   frame restore. Stray presses re-arm only the time left (RTC deadline).
+   SDA/SCL are held pulled up in the powered sleep. Every lock sleep logs
+   `deep-lock wake|cap: slept Ns rem A->B mAh avg X mA stray-wakes N` from the
+   BQ27220 RemainingCapacity and `esp_rtc_get_time_us()`; any future power claim
+   must cite that line. Stock X3 power-off drains 0.2-0.5 %/h per upstream #2782.
+   Full write-up: `../xteink/docs/lock-battery-investigation-2026-09-15.md`.
    A hit restores the saved frame minus the badge with one FAST refresh and reloads
    the reader behind it. Two reviewer passes (2026-09-14) signed off on this shape;
    the alternative they offered is a 300 ms hold instead of tap-tap if the double
